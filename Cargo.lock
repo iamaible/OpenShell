@@ -2948,6 +2948,7 @@ dependencies = [
  "miette",
  "nix",
  "openshell-core",
+ "openshell-ocsf",
  "openshell-policy",
  "openshell-router",
  "rand_core 0.6.4",
