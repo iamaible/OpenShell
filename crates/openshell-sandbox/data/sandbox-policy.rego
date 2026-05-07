@@ -47,7 +47,7 @@ deny_reason := reason if {
 		policy := data.network_policies[name]
 		endpoint_allowed(policy, input.network)
 		not binary_allowed(policy, input.exec)
-		r := sprintf("binary '%s' (ancestors: [%s], cmdline: [%s]) not allowed in policy '%s'", [input.exec.path, ancestors_str, cmdline_str, name])
+		r := sprintf("binary '%s' not allowed in policy '%s' (ancestors: [%s], cmdline: [%s]). SYMLINK HINT: the binary path is the kernel-resolved target from /proc/<pid>/exe, not the symlink. If your policy specifies a symlink (e.g., /usr/bin/python3) but the actual binary is /usr/bin/python3.11, either: (1) use the canonical path in your policy (run 'readlink -f /usr/bin/python3' inside the sandbox), or (2) ensure symlink resolution is working (check sandbox logs for 'Cannot access container filesystem')", [input.exec.path, name, ancestors_str, cmdline_str])
 	]
 	all_reasons := array.concat(endpoint_misses, binary_misses)
 	count(all_reasons) > 0
@@ -179,24 +179,176 @@ default allow_request = false
 _policy_allows_l7(policy) if {
 	some ep
 	ep := policy.endpoints[_]
-	endpoint_matches_request(ep, input.network)
+	endpoint_matches_l7_request(ep, input.network, input.request)
 	request_allowed_for_endpoint(input.request, ep)
 }
 
-# L7 request allowed if any matching L4 policy also allows the L7 request.
+# L7 request allowed if any matching L4 policy also allows the L7 request
+# AND no deny rule blocks it. Deny rules take precedence over allow rules.
 allow_request if {
 	some name
 	policy := data.network_policies[name]
 	endpoint_allowed(policy, input.network)
 	binary_allowed(policy, input.exec)
 	_policy_allows_l7(policy)
+	not deny_request
+}
+
+# --- L7 deny rules ---
+#
+# Deny rules are evaluated after allow rules and take precedence.
+# If a request matches any deny rule on any matching endpoint, it is blocked
+# even if it would otherwise be allowed.
+
+default deny_request = false
+
+# Per-policy helper: true when this policy has at least one endpoint matching
+# the L4 request whose deny_rules also match the specific L7 request.
+_policy_denies_l7(policy) if {
+	some ep
+	ep := policy.endpoints[_]
+	endpoint_matches_l7_request(ep, input.network, input.request)
+	request_denied_for_endpoint(input.request, ep)
+}
+
+deny_request if {
+	some name
+	policy := data.network_policies[name]
+	endpoint_allowed(policy, input.network)
+	binary_allowed(policy, input.exec)
+	_policy_denies_l7(policy)
+}
+
+# --- L7 deny rule matching: REST method + path + query ---
+
+request_denied_for_endpoint(request, endpoint) if {
+	some deny_rule
+	deny_rule := endpoint.deny_rules[_]
+	deny_rule.method
+	method_matches(request.method, deny_rule.method)
+	path_matches(request.path, deny_rule.path)
+	deny_query_params_match(request, deny_rule)
+}
+
+# --- L7 deny rule matching: SQL command ---
+
+request_denied_for_endpoint(request, endpoint) if {
+	some deny_rule
+	deny_rule := endpoint.deny_rules[_]
+	deny_rule.command
+	command_matches(request.command, deny_rule.command)
+}
+
+# --- L7 deny rule matching: GraphQL operation ---
+
+request_denied_for_endpoint(request, endpoint) if {
+	graphql_request_has_operations(request)
+	some deny_rule
+	deny_rule := endpoint.deny_rules[_]
+	deny_rule.operation_type
+	op := request.graphql.operations[_]
+	graphql_deny_rule_matches_operation(op, deny_rule, endpoint)
+}
+
+# A GraphQL endpoint path is authoritative once it matches. If the parsed
+# GraphQL request is malformed, hash-only without a trusted registry entry, or
+# contains an operation outside the GraphQL allow rules, a broader REST rule on
+# the same host:port must not allow it through.
+request_denied_for_endpoint(request, endpoint) if {
+	endpoint.protocol == "graphql"
+	is_object(request.graphql)
+	not graphql_request_allowed(request, endpoint)
+}
+
+# Deny query matching: fail-closed semantics.
+# If no query rules on the deny rule, match unconditionally (any query params).
+# If query rules present, trigger the deny if ANY value for a configured key
+# matches the matcher. This is the inverse of allow-side semantics where ALL
+# values must match. For deny logic, a single matching value is enough to block.
+deny_query_params_match(request, deny_rule) if {
+	deny_query_rules := object.get(deny_rule, "query", {})
+	count(deny_query_rules) == 0
+}
+
+deny_query_params_match(request, deny_rule) if {
+	deny_query_rules := object.get(deny_rule, "query", {})
+	count(deny_query_rules) > 0
+	not deny_query_key_missing(request, deny_query_rules)
+	not deny_query_value_mismatch_all(request, deny_query_rules)
+}
+
+# A configured deny query key is missing from the request entirely.
+# Missing key means the deny rule doesn't apply (fail-open on absence).
+deny_query_key_missing(request, query_rules) if {
+	some key
+	query_rules[key]
+	request_query := object.get(request, "query_params", {})
+	values := object.get(request_query, key, null)
+	values == null
+}
+
+# ALL values for a configured key fail to match the matcher.
+# If even one value matches, deny fires. This rule checks the opposite:
+# true when NO value matches (i.e., every value is a mismatch).
+deny_query_value_mismatch_all(request, query_rules) if {
+	some key
+	matcher := query_rules[key]
+	request_query := object.get(request, "query_params", {})
+	values := object.get(request_query, key, [])
+	count(values) > 0
+	not deny_any_value_matches(values, matcher)
+}
+
+# True if at least one value in the list matches the matcher.
+deny_any_value_matches(values, matcher) if {
+	some i
+	query_value_matches(values[i], matcher)
 }
 
 # --- L7 deny reason ---
 
 request_deny_reason := reason if {
 	input.request
+	graphql_request_error(input.request)
+	reason := sprintf("GraphQL request rejected: %s", [input.request.graphql.error])
+}
+
+request_deny_reason := reason if {
+	input.request
+	not graphql_request_error(input.request)
+	graphql_request_has_unregistered_persisted_query(input.request, matched_endpoint_config)
+	reason := "GraphQL persisted query is not registered"
+}
+
+request_deny_reason := reason if {
+	input.request
+	deny_request
+	graphql_request_has_operations(input.request)
+	not graphql_request_has_unregistered_persisted_query(input.request, matched_endpoint_config)
+	reason := "GraphQL operation blocked by endpoint policy"
+}
+
+request_deny_reason := reason if {
+	input.request
+	not deny_request
 	not allow_request
+	graphql_request_has_operations(input.request)
+	not graphql_request_has_unregistered_persisted_query(input.request, matched_endpoint_config)
+	reason := "GraphQL operation not permitted by policy"
+}
+
+request_deny_reason := reason if {
+	input.request
+	deny_request
+	not graphql_request_has_operations(input.request)
+	reason := sprintf("%s %s blocked by deny rule", [input.request.method, input.request.path])
+}
+
+request_deny_reason := reason if {
+	input.request
+	not deny_request
+	not allow_request
+	not graphql_request_has_operations(input.request)
 	reason := sprintf("%s %s not permitted by policy", [input.request.method, input.request.path])
 }
 
@@ -220,6 +372,149 @@ request_allowed_for_endpoint(request, endpoint) if {
 	command_matches(request.command, rule.allow.command)
 }
 
+# --- L7 rule matching: GraphQL operation ---
+
+request_allowed_for_endpoint(request, endpoint) if {
+	graphql_request_allowed(request, endpoint)
+}
+
+graphql_request_allowed(request, endpoint) if {
+	graphql_request_has_operations(request)
+	not graphql_request_error(request)
+	not graphql_request_has_unregistered_persisted_query(request, endpoint)
+	not graphql_request_has_unallowed_operation(request, endpoint)
+}
+
+graphql_request_has_operations(request) if {
+	is_object(request.graphql)
+	operations := object.get(request.graphql, "operations", [])
+	count(operations) > 0
+}
+
+graphql_request_error(request) if {
+	is_object(request.graphql)
+	error := object.get(request.graphql, "error", "")
+	error != ""
+}
+
+graphql_request_has_unallowed_operation(request, endpoint) if {
+	op := request.graphql.operations[_]
+	not graphql_operation_allowed(op, endpoint)
+}
+
+graphql_operation_allowed(op, endpoint) if {
+	rule := endpoint.rules[_]
+	rule.allow.operation_type
+	graphql_allow_rule_matches_operation(op, rule.allow, endpoint)
+}
+
+graphql_request_has_unregistered_persisted_query(request, endpoint) if {
+	op := request.graphql.operations[_]
+	graphql_operation_needs_registry(op)
+	not graphql_registered_operation(op, endpoint)
+}
+
+graphql_operation_needs_registry(op) if {
+	object.get(op, "persisted_query", false) == true
+	object.get(op, "operation_type", "") == ""
+}
+
+graphql_registered_operation(op, endpoint) if {
+	object.get(endpoint, "persisted_queries", "deny") == "allow_registered"
+	id := graphql_operation_registry_key(op)
+	endpoint.graphql_persisted_queries[id]
+}
+
+graphql_operation_registry_key(op) := key if {
+	key := object.get(op, "persisted_query_hash", "")
+	key != ""
+}
+
+graphql_operation_registry_key(op) := key if {
+	object.get(op, "persisted_query_hash", "") == ""
+	key := object.get(op, "persisted_query_id", "")
+	key != ""
+}
+
+graphql_effective_operation(op, endpoint) := registered if {
+	graphql_operation_needs_registry(op)
+	key := graphql_operation_registry_key(op)
+	registered := endpoint.graphql_persisted_queries[key]
+}
+
+graphql_effective_operation(op, _) := op if {
+	not graphql_operation_needs_registry(op)
+}
+
+graphql_allow_rule_matches_operation(op, rule, endpoint) if {
+	effective := graphql_effective_operation(op, endpoint)
+	graphql_operation_type_matches(effective, rule)
+	graphql_operation_name_matches(effective, rule)
+	graphql_allow_fields_match(effective, rule)
+}
+
+graphql_deny_rule_matches_operation(op, rule, endpoint) if {
+	effective := graphql_effective_operation(op, endpoint)
+	graphql_operation_type_matches(effective, rule)
+	graphql_operation_name_matches(effective, rule)
+	graphql_deny_fields_match(effective, rule)
+}
+
+graphql_operation_type_matches(_, rule) if {
+	object.get(rule, "operation_type", "") == "*"
+}
+
+graphql_operation_type_matches(op, rule) if {
+	expected := object.get(rule, "operation_type", "")
+	expected != ""
+	expected != "*"
+	lower(object.get(op, "operation_type", "")) == lower(expected)
+}
+
+graphql_operation_name_matches(_, rule) if {
+	object.get(rule, "operation_name", "") == ""
+}
+
+graphql_operation_name_matches(op, rule) if {
+	pattern := object.get(rule, "operation_name", "")
+	pattern != ""
+	name := object.get(op, "operation_name", "")
+	glob.match(pattern, [], name)
+}
+
+# Allow-side field constraints are intentionally all-selected-fields semantics:
+# if a rule declares fields, every root field selected by the operation must
+# match one of the rule patterns. This prevents mixed-operation requests from
+# allowing an unlisted field because one safe field also appeared.
+graphql_allow_fields_match(_, rule) if {
+	count(object.get(rule, "fields", [])) == 0
+}
+
+graphql_allow_fields_match(op, rule) if {
+	count(object.get(rule, "fields", [])) > 0
+	count(object.get(op, "fields", [])) > 0
+	not graphql_operation_has_unmatched_field(op, rule)
+}
+
+graphql_operation_has_unmatched_field(op, rule) if {
+	field := object.get(op, "fields", [])[_]
+	not graphql_field_matches_any(field, object.get(rule, "fields", []))
+}
+
+graphql_deny_fields_match(_, rule) if {
+	count(object.get(rule, "fields", [])) == 0
+}
+
+graphql_deny_fields_match(op, rule) if {
+	field := object.get(op, "fields", [])[_]
+	graphql_field_matches_any(field, object.get(rule, "fields", []))
+}
+
+graphql_field_matches_any(field, patterns) if {
+	pattern := patterns[_]
+	glob.match(pattern, [], field)
+}
+
 # Wildcard "*" matches any method; otherwise case-insensitive exact match.
 method_matches(_, "*") if true
 
@@ -229,6 +524,13 @@ method_matches(actual, expected) if {
 }
 
 # Path matching: "**" matches everything; otherwise glob.match with "/" delimiter.
+#
+# INVARIANT: `input.request.path` is canonicalized by the sandbox before
+# policy evaluation — percent-decoded, dot-segments resolved, doubled
+# slashes collapsed, `;params` stripped, `%2F` rejected (unless an
+# endpoint opts in). Patterns here must therefore match canonical paths;
+# do not attempt defensive matching against `..` or `%2e%2e` — those
+# inputs are rejected at the L7 parser boundary before this rule runs.
 path_matches(_, "**") if true
 
 path_matches(actual, pattern) if {
@@ -295,8 +597,8 @@ command_matches(actual, expected) if {
 
 # --- Matched endpoint config (for L7 and allowed_ips extraction) ---
 # Returns the raw endpoint object for the matched policy + host:port.
-# Used by Rust to extract L7 config (protocol, tls, enforcement) and/or
-# allowed_ips for SSRF allowlist validation.
+# Used by Rust to extract L7 config (protocol, tls, enforcement,
+# allow_encoded_slash) and/or allowed_ips for SSRF allowlist validation.
 
 # Per-policy helper: returns matching endpoint configs for a single policy.
 _policy_endpoint_configs(policy) := [ep |
@@ -339,6 +641,21 @@ endpoint_matches_request(ep, network) if {
 	object.get(ep, "host", "") == ""
 	count(object.get(ep, "allowed_ips", [])) > 0
 	ep.ports[_] == network.port
+}
+
+endpoint_matches_l7_request(ep, network, request) if {
+	endpoint_matches_request(ep, network)
+	endpoint_path_matches_request(ep, request)
+}
+
+endpoint_path_matches_request(ep, request) if {
+	object.get(ep, "path", "") == ""
+}
+
+endpoint_path_matches_request(ep, request) if {
+	path := object.get(ep, "path", "")
+	path != ""
+	path_matches(request.path, path)
 }
 
 # An endpoint has extended config if it specifies L7 protocol, allowed_ips,

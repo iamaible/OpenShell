@@ -9,6 +9,7 @@ use clap_complete::env::CompleteEnv;
 use miette::Result;
 use owo_colors::OwoColorize;
 use std::io::Write;
+use std::path::PathBuf;
 
 use openshell_bootstrap::{
     edge_token::load_edge_token, get_gateway_metadata, list_gateways, load_active_gateway,
@@ -62,9 +63,13 @@ fn resolve_gateway(
     gateway_endpoint: &Option<String>,
 ) -> Result<GatewayContext> {
     if let Some(endpoint) = gateway_endpoint {
+        // When a gateway name is explicitly provided (via flag or env var),
+        // trust it directly — don't require metadata to exist yet. This
+        // avoids a race condition where mTLS certs are stored under the
+        // real gateway name but the CLI falls back to using the raw
+        // endpoint URL (producing a mangled path like `https___...`).
         let name = gateway_flag
             .clone()
-            .filter(|name| get_gateway_metadata(name).is_some())
             .or_else(|| find_gateway_by_endpoint(endpoint))
             .unwrap_or_else(|| endpoint.clone());
         return Ok(GatewayContext {
@@ -85,14 +90,14 @@ fn resolve_gateway(
             miette::miette!(
                 "No active gateway.\n\
                  Set one with: openshell gateway select <name>\n\
-                 Or deploy a new gateway: openshell gateway start"
+                 Or register one with: openshell gateway add <endpoint>"
             )
         })?;
 
     let metadata = load_gateway_metadata(&name).map_err(|_| {
         miette::miette!(
             "Unknown gateway '{name}'.\n\
-             Deploy it first: openshell gateway start --name {name}\n\
+             Register it first: openshell gateway add <endpoint> --name {name}\n\
              Or list available gateways: openshell gateway select"
         )
     })?;
@@ -103,10 +108,6 @@ fn resolve_gateway(
     })
 }
 
-/// Resolve only the gateway name (without requiring metadata to exist).
-///
-/// Used by gateway commands that operate on a gateway by name but may not need
-/// the gateway endpoint (e.g., `gateway start` creates the gateway).
 fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
     gateway_flag
         .clone()
@@ -118,17 +119,52 @@ fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
         .or_else(load_active_gateway)
 }
 
-/// Apply edge authentication token from local storage when the gateway uses edge auth.
+/// Apply authentication token from local storage based on gateway auth mode.
 ///
-/// When the resolved gateway has `auth_mode == "cloudflare_jwt"`, loads the
-/// stored edge token from disk and sets it on the `TlsOptions`. The token is
-/// always read from gateway metadata rather than supplied via a CLI flag.
-fn apply_edge_auth(tls: &mut TlsOptions, gateway_name: &str) {
-    if let Some(meta) = get_gateway_metadata(gateway_name)
-        && meta.auth_mode.as_deref() == Some("cloudflare_jwt")
-        && let Some(token) = load_edge_token(gateway_name)
-    {
-        tls.edge_token = Some(token);
+/// Handles both Cloudflare Access (`edge_token`) and OIDC (`oidc_token`)
+/// auth modes by loading the stored token and setting it on `TlsOptions`.
+/// For OIDC, automatically refreshes the token if it's near expiry.
+fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
+    let Some(meta) = get_gateway_metadata(gateway_name) else {
+        return;
+    };
+    match meta.auth_mode.as_deref() {
+        Some("cloudflare_jwt") => {
+            if let Some(token) = load_edge_token(gateway_name) {
+                tls.edge_token = Some(token);
+            }
+        }
+        Some("oidc") => {
+            let Some(bundle) = openshell_bootstrap::oidc_token::load_oidc_token(gateway_name)
+            else {
+                return;
+            };
+            if openshell_bootstrap::oidc_token::is_token_expired(&bundle) {
+                // Try to refresh the token in-place using block_in_place
+                // so the async refresh can run within the sync apply_auth call.
+                match tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(openshell_cli::oidc_auth::oidc_refresh_token(&bundle))
+                }) {
+                    Ok(refreshed) => {
+                        let _ = openshell_bootstrap::oidc_token::store_oidc_token(
+                            gateway_name,
+                            &refreshed,
+                        );
+                        tls.oidc_token = Some(refreshed.access_token);
+                    }
+                    Err(e) => {
+                        tracing::warn!("OIDC token refresh failed: {e}");
+                        // Use the expired token anyway — server will reject it
+                        // with a clear error prompting re-login.
+                        tls.oidc_token = Some(bundle.access_token);
+                    }
+                }
+            } else {
+                tls.oidc_token = Some(bundle.access_token);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -147,7 +183,7 @@ fn resolve_sandbox_name(name: Option<String>, gateway: &str) -> Result<String> {
              Specify a sandbox name or connect to one first: nav sandbox connect <name>"
         )
     })?;
-    eprintln!("{} Using sandbox '{}' (last used)", "→".bold(), last.bold(),);
+    eprintln!("{} Using sandbox '{}' (last used)", "→".bold(), last.bold());
     Ok(last)
 }
 
@@ -168,7 +204,7 @@ const HELP_TEMPLATE: &str = "\
   provider:    Manage provider configuration
 
 \x1b[1mGATEWAY COMMANDS\x1b[0m
-  gateway:     Manage the gateway lifecycle
+  gateway:     Manage gateway registrations
   status:      Show gateway status and information
   inference:   Manage inference configuration
   doctor:      Diagnose gateway issues
@@ -184,7 +220,7 @@ const HELP_TEMPLATE: &str = "\
 
 \x1b[1mEXAMPLES\x1b[0m
   $ openshell sandbox create
-  $ openshell gateway start
+  $ openshell gateway add http://127.0.0.1:8080 --local
   $ openshell logs my-sandbox
 
 \x1b[1mLEARN MORE\x1b[0m
@@ -250,6 +286,8 @@ const POLICY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 \x1b[1mEXAMPLES\x1b[0m
   $ openshell policy get my-sandbox
   $ openshell policy set my-sandbox --policy policy.yaml
+  $ openshell policy update my-sandbox --add-endpoint api.github.com:443:read-only:rest:enforce
+  $ openshell policy update my-sandbox --add-allow 'api.github.com:443:GET:/repos/**'
   $ openshell policy set --global --policy policy.yaml
   $ openshell policy delete --global
   $ openshell policy list my-sandbox
@@ -258,11 +296,10 @@ const POLICY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 const SETTINGS_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
   $ openshell settings get my-sandbox
   $ openshell settings get --global
-  $ openshell settings set my-sandbox --key log_level --value debug
-  $ openshell settings set --global --key log_level --value warn
-  $ openshell settings set --global --key dummy_bool --value yes
-  $ openshell settings set --global --key dummy_int --value 42
-  $ openshell settings delete --global --key log_level
+  $ openshell settings set --global --key providers_v2_enabled --value true
+  $ openshell settings set my-sandbox --key ocsf_json_enabled --value true
+  $ openshell settings set --global --key ocsf_json_enabled --value true
+  $ openshell settings delete --global --key providers_v2_enabled
 ";
 
 const PROVIDER_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
@@ -277,11 +314,10 @@ const GATEWAY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   gw
 
 \x1b[1mEXAMPLES\x1b[0m
-  $ openshell gateway start
-  $ openshell gateway start --name my-gateway --port 9090
-  $ openshell gateway stop
+  $ openshell gateway add http://127.0.0.1:8080 --local
   $ openshell gateway select my-gateway
   $ openshell gateway info
+  $ openshell gateway remove my-gateway
 ";
 
 const INFERENCE_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
@@ -295,18 +331,6 @@ const DOCTOR_HELP: &str = "\x1b[1mALIAS\x1b[0m
 
 \x1b[1mEXAMPLES\x1b[0m
   $ openshell doctor check
-  $ openshell doctor logs --lines 100
-  $ openshell doctor exec -- kubectl get pods -A
-  $ openshell doctor llm.txt
-
-\x1b[1mAI AGENT USAGE\x1b[0m
-  If you are a coding agent (LLM) diagnosing a gateway issue, run:
-
-    openshell doctor llm.txt
-
-  This prints a detailed diagnostic prompt with step-by-step instructions
-  for debugging gateway clusters using `openshell doctor logs` and
-  `openshell doctor exec`.
 ";
 
 /// `OpenShell` CLI - agent execution and management.
@@ -338,6 +362,15 @@ struct Cli {
         help_heading = "GATEWAY FLAGS"
     )]
     gateway_endpoint: Option<String>,
+
+    /// Skip TLS certificate verification for gateway connections.
+    #[arg(
+        long,
+        global = true,
+        env = "OPENSHELL_GATEWAY_INSECURE",
+        help_heading = "GATEWAY FLAGS"
+    )]
+    gateway_insecure: bool,
 
     /// Increase verbosity (-v, -vv, -vvv).
     #[arg(short, long, action = clap::ArgAction::Count, global = true, help_heading = "GLOBAL FLAGS")]
@@ -434,7 +467,7 @@ enum Commands {
     // ===================================================================
     // GATEWAY COMMANDS
     // ===================================================================
-    /// Manage the gateway lifecycle.
+    /// Manage gateway registrations.
     #[command(alias = "gw", after_help = GATEWAY_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Gateway {
         #[command(subcommand)]
@@ -457,9 +490,7 @@ enum Commands {
     // ===================================================================
     /// Diagnose gateway issues.
     ///
-    /// Inspect logs, run commands inside the gateway container, and get
-    /// AI-assisted debugging guidance. If you are a coding agent, run
-    /// `openshell doctor llm.txt` for a full diagnostic prompt.
+    /// Check local prerequisites for gateway development.
     #[command(visible_alias = "dr", hide = true, after_help = DOCTOR_HELP, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Doctor {
         #[command(subcommand)]
@@ -593,18 +624,20 @@ fn normalize_completion_script(output: Vec<u8>, executable: &std::path::Path) ->
 }
 
 #[derive(Clone, Debug, ValueEnum)]
-enum CliProviderType {
-    Claude,
-    Opencode,
-    Codex,
-    Copilot,
-    Generic,
-    Openai,
-    Anthropic,
-    Nvidia,
-    Gitlab,
-    Github,
-    Outlook,
+enum ProviderProfileOutput {
+    Table,
+    Yaml,
+    Json,
+}
+
+impl ProviderProfileOutput {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Yaml => "yaml",
+            Self::Json => "json",
+        }
+    }
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -622,24 +655,6 @@ impl From<CliEditor> for openshell_cli::ssh::Editor {
     }
 }
 
-impl CliProviderType {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Opencode => "opencode",
-            Self::Codex => "codex",
-            Self::Copilot => "copilot",
-            Self::Generic => "generic",
-            Self::Openai => "openai",
-            Self::Anthropic => "anthropic",
-            Self::Nvidia => "nvidia",
-            Self::Gitlab => "gitlab",
-            Self::Github => "github",
-            Self::Outlook => "outlook",
-        }
-    }
-}
-
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
@@ -650,8 +665,8 @@ enum ProviderCommands {
         name: String,
 
         /// Provider type.
-        #[arg(long = "type", value_enum)]
-        provider_type: CliProviderType,
+        #[arg(long = "type")]
+        provider_type: String,
 
         /// Load provider credentials/config from existing local state.
         #[arg(long, conflicts_with = "credentials")]
@@ -694,6 +709,18 @@ enum ProviderCommands {
         names: bool,
     },
 
+    /// List available provider profiles.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    ListProfiles {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = ProviderProfileOutput::Table)]
+        output: ProviderProfileOutput,
+    },
+
+    /// Manage provider profiles.
+    #[command(subcommand, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Profile(ProviderProfileCommands),
+
     /// Update an existing provider's credentials or config.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Update {
@@ -727,146 +754,78 @@ enum ProviderCommands {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum ProviderProfileCommands {
+    /// Export a provider profile.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Export {
+        /// Provider profile id.
+        id: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = ProviderProfileOutput::Yaml)]
+        output: ProviderProfileOutput,
+    },
+
+    /// Import provider profiles from a file or directory.
+    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Import {
+        /// Profile file to import.
+        #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
+        file: Option<PathBuf>,
+
+        /// Directory containing profile files to import.
+        #[arg(long = "from", value_hint = ValueHint::DirPath)]
+        from: Option<PathBuf>,
+    },
+
+    /// Validate provider profile files without registering them.
+    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Lint {
+        /// Profile file to lint.
+        #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
+        file: Option<PathBuf>,
+
+        /// Directory containing profile files to lint.
+        #[arg(long = "from", value_hint = ValueHint::DirPath)]
+        from: Option<PathBuf>,
+    },
+
+    /// Delete a custom provider profile.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Provider profile id.
+        id: String,
+    },
+}
+
 // -----------------------------------------------------------------------
 // Gateway commands (replaces the old `cluster` / `cluster admin` groups)
 // -----------------------------------------------------------------------
 
 #[derive(Subcommand, Debug)]
 enum GatewayCommands {
-    /// Deploy/start the gateway.
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Start {
-        /// Gateway name.
-        #[arg(long, default_value = "openshell", env = "OPENSHELL_GATEWAY")]
-        name: String,
-
-        /// SSH destination for remote deployment (e.g., user@hostname).
-        #[arg(long)]
-        remote: Option<String>,
-
-        /// Path to SSH private key for remote deployment.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        ssh_key: Option<String>,
-
-        /// Host port to map to the gateway (default: 8080).
-        #[arg(long, default_value_t = openshell_bootstrap::DEFAULT_GATEWAY_PORT)]
-        port: u16,
-
-        /// Override the gateway host written into cluster metadata.
-        ///
-        /// By default, local clusters advertise 127.0.0.1. Set this when
-        /// the client cannot reach the Docker host at 127.0.0.1 — for
-        /// example in CI containers, WSL, or when Docker runs on a
-        /// remote host. Common values: `host.docker.internal`, a LAN IP,
-        /// or a hostname.
-        #[arg(long)]
-        gateway_host: Option<String>,
-
-        /// Destroy and recreate the gateway from scratch if one already exists.
-        ///
-        /// Without this flag, an interactive prompt asks whether to recreate;
-        /// in non-interactive mode the existing gateway is reused silently.
-        #[arg(long)]
-        recreate: bool,
-
-        /// Listen on plaintext HTTP instead of mTLS.
-        ///
-        /// Use when the gateway sits behind a reverse proxy (e.g., Cloudflare
-        /// Tunnel) that terminates TLS at the edge.
-        #[arg(long)]
-        plaintext: bool,
-
-        /// Disable gateway authentication (mTLS client certificate requirement).
-        ///
-        /// The server still listens on TLS, but clients are not required to
-        /// present a certificate. Use when a reverse proxy (e.g., Cloudflare
-        /// Tunnel) terminates TLS and cannot forward client certs.
-        /// Ignored when --plaintext is set.
-        #[arg(long)]
-        disable_gateway_auth: bool,
-
-        /// Username for authenticating with the container image registry.
-        ///
-        /// Defaults to `__token__` when `--registry-token` is set (the
-        /// standard convention for GHCR PAT-based auth). Only needed for
-        /// private registries — public GHCR repos pull without auth.
-        #[arg(long, env = "OPENSHELL_REGISTRY_USERNAME")]
-        registry_username: Option<String>,
-
-        /// Authentication token for pulling container images from the registry.
-        ///
-        /// For GHCR, this is a GitHub personal access token (PAT) with
-        /// `read:packages` scope. Only needed for private registries —
-        /// public GHCR repos pull without auth. Used to pull the cluster
-        /// bootstrap image and passed into the k3s cluster so it can pull
-        /// server, sandbox, and community images at runtime.
-        #[arg(long, env = "OPENSHELL_REGISTRY_TOKEN")]
-        registry_token: Option<String>,
-
-        /// Enable NVIDIA GPU passthrough.
-        ///
-        /// Passes all host GPUs into the cluster container and deploys the
-        /// NVIDIA k8s-device-plugin so Kubernetes workloads can request
-        /// `nvidia.com/gpu` resources. Requires NVIDIA drivers and the
-        /// NVIDIA Container Toolkit on the host.
-        ///
-        /// When enabled, OpenShell auto-selects CDI when the Docker daemon has
-        /// CDI enabled and falls back to Docker's NVIDIA GPU request path
-        /// (`--gpus all`) otherwise.
-        #[arg(long)]
-        gpu: bool,
-    },
-
-    /// Stop the gateway (preserves state).
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Stop {
-        /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "OPENSHELL_GATEWAY", add = ArgValueCompleter::new(completers::complete_gateway_names))]
-        name: Option<String>,
-
-        /// Override SSH destination (auto-resolved from gateway metadata).
-        #[arg(long)]
-        remote: Option<String>,
-
-        /// Path to SSH private key for remote gateway.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        ssh_key: Option<String>,
-    },
-
-    /// Destroy the gateway and its state.
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Destroy {
-        /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "OPENSHELL_GATEWAY", add = ArgValueCompleter::new(completers::complete_gateway_names))]
-        name: Option<String>,
-
-        /// Override SSH destination (auto-resolved from gateway metadata).
-        #[arg(long)]
-        remote: Option<String>,
-
-        /// Path to SSH private key for remote gateway.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        ssh_key: Option<String>,
-    },
-
     /// Add an existing gateway.
     ///
     /// Registers a gateway endpoint so it appears in `openshell gateway select`.
     ///
-    /// Without extra flags the gateway is treated as an edge-authenticated
-    /// (cloud) gateway and a browser is opened for authentication.
+    /// An `http://...` endpoint is treated as a direct plaintext gateway and
+    /// skips both mTLS client certificate lookup and browser authentication.
     ///
-    /// Pass `--remote <ssh-dest>` to register a remote mTLS gateway whose
-    /// Docker daemon is reachable over SSH. Pass `--local` to register a
-    /// local mTLS gateway running in Docker on this machine. In both cases
-    /// the CLI extracts mTLS certificates from the running container
-    /// automatically.
+    /// Without extra flags, an `https://...` endpoint is treated as an
+    /// edge-authenticated (cloud) gateway and a browser is opened for
+    /// authentication.
+    ///
+    /// Pass `--remote <ssh-dest>` to register a remote mTLS gateway. Pass
+    /// `--local` to register a local mTLS gateway. In both cases, mTLS
+    /// certificates must already exist in the gateway config directory.
     ///
     /// An `ssh://` endpoint (e.g., `ssh://user@host:8080`) is shorthand
     /// for `--remote user@host` with the endpoint derived from the URL.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Add {
-        /// Gateway endpoint URL (e.g., `https://10.0.0.5:8080` or `ssh://user@host:8080`).
+        /// Gateway endpoint URL (for example `http://127.0.0.1:8080`,
+        /// `https://10.0.0.5:8080`, or `ssh://user@host:8080`).
         endpoint: String,
 
         /// Gateway name (auto-derived from the endpoint hostname when omitted).
@@ -874,24 +833,64 @@ enum GatewayCommands {
         name: Option<String>,
 
         /// Register a remote mTLS gateway accessible via SSH.
+        /// With `http://...`, stores a remote plaintext registration instead.
         #[arg(long, conflicts_with = "local")]
         remote: Option<String>,
 
-        /// SSH private key for the remote host (used with `--remote` or `ssh://`).
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        ssh_key: Option<String>,
-
         /// Register a local mTLS gateway running in Docker on this machine.
+        /// With `http://...`, stores a local plaintext registration instead.
         #[arg(long, conflicts_with = "remote")]
         local: bool,
+
+        /// Register as an OIDC-authenticated gateway using the given issuer URL.
+        /// The server must be configured with `--oidc-issuer` matching this URL.
+        #[arg(long, conflicts_with = "remote")]
+        oidc_issuer: Option<String>,
+
+        /// OIDC client ID for the CLI login flow (defaults to "openshell-cli").
+        #[arg(long, default_value = "openshell-cli", requires = "oidc_issuer")]
+        oidc_client_id: String,
+
+        /// OIDC audience for the API resource server. When different from
+        /// the client ID, the CLI requests this audience in the token exchange.
+        /// Defaults to the client ID value.
+        #[arg(long, requires = "oidc_issuer")]
+        oidc_audience: Option<String>,
+
+        /// Space-separated `OAuth2` scopes to request during OIDC login.
+        /// When set, tokens will include these scopes for fine-grained access control.
+        #[arg(long, requires = "oidc_issuer")]
+        oidc_scopes: Option<String>,
     },
 
-    /// Authenticate with an edge-authenticated gateway.
+    /// Remove a local gateway registration.
+    ///
+    /// This only removes CLI metadata and stored auth tokens. It does not stop
+    /// or destroy the gateway service.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Remove {
+        /// Gateway name (defaults to active gateway).
+        #[arg(add = ArgValueCompleter::new(completers::complete_gateway_names))]
+        name: Option<String>,
+    },
+
+    /// Authenticate with an edge-authenticated or OIDC gateway.
     ///
     /// Opens a browser for the edge proxy's login flow and stores the
     /// token locally. Use this to re-authenticate when a token expires.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Login {
+        /// Gateway name (defaults to the active gateway).
+        #[arg(add = ArgValueCompleter::new(completers::complete_gateway_names))]
+        name: Option<String>,
+    },
+
+    /// Clear stored authentication credentials for a gateway.
+    ///
+    /// Removes the locally stored OIDC token or edge token so subsequent
+    /// commands require re-authentication via `gateway login`.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Logout {
         /// Gateway name (defaults to the active gateway).
         #[arg(add = ArgValueCompleter::new(completers::complete_gateway_names))]
         name: Option<String>,
@@ -908,13 +907,20 @@ enum GatewayCommands {
         name: Option<String>,
     },
 
-    /// Show gateway deployment details.
+    /// Show gateway registration details.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Info {
         /// Gateway name (defaults to active gateway).
         #[arg(long, env = "OPENSHELL_GATEWAY", add = ArgValueCompleter::new(completers::complete_gateway_names))]
         name: Option<String>,
     },
+
+    /// List registered gateways.
+    ///
+    /// Prints a table of all registered gateways with their endpoint, type,
+    /// and authentication mode. The active gateway is marked with `*`.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List,
 }
 
 // -----------------------------------------------------------------------
@@ -989,76 +995,10 @@ enum InferenceCommands {
 
 #[derive(Subcommand, Debug)]
 enum DoctorCommands {
-    /// Fetch logs from the gateway container.
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Logs {
-        /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "OPENSHELL_GATEWAY")]
-        name: Option<String>,
-
-        /// Number of log lines to return (default: all).
-        #[arg(short, long)]
-        lines: Option<usize>,
-
-        /// Stream live logs (follow mode).
-        #[arg(long)]
-        tail: bool,
-
-        /// Override SSH destination for remote gateways.
-        #[arg(long)]
-        remote: Option<String>,
-
-        /// Path to SSH private key for remote gateways.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        ssh_key: Option<String>,
-    },
-
-    /// Run a command inside the gateway container.
-    ///
-    /// Launches an interactive `docker exec` session in the gateway's k3s
-    /// container with KUBECONFIG pre-configured.  When the gateway is remote,
-    /// the session is tunnelled over SSH automatically.
-    ///
-    /// Examples:
-    ///   openshell doctor exec -- kubectl get pods -A
-    ///   openshell doctor exec -- k9s
-    ///   openshell doctor exec -- sh
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Exec {
-        /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "OPENSHELL_GATEWAY")]
-        name: Option<String>,
-
-        /// Override SSH destination for remote gateways.
-        #[arg(long)]
-        remote: Option<String>,
-
-        /// Path to SSH private key for remote gateways.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        ssh_key: Option<String>,
-
-        /// Command and arguments to run inside the container.
-        #[arg(trailing_var_arg = true, required = true)]
-        command: Vec<String>,
-    },
-
-    /// Print a diagnostic prompt for AI-assisted gateway debugging.
-    ///
-    /// Outputs a system prompt that a coding agent can use to autonomously
-    /// diagnose gateway issues using `openshell doctor logs` and
-    /// `openshell doctor exec`.
-    ///
-    /// Examples:
-    ///   openshell doctor llm.txt
-    ///   openshell doctor llm.txt | pbcopy
-    #[command(name = "llm.txt", help_template = LEAF_HELP_TEMPLATE)]
-    LlmTxt,
-
     /// Validate system prerequisites for running a gateway.
     ///
     /// Checks that a Docker-compatible runtime is installed, running, and
-    /// reachable. Reports version info and socket path. Use this to verify
-    /// your environment before running `openshell gateway start`.
+    /// reachable. Reports version info and socket path.
     ///
     /// Examples:
     ///   openshell doctor check
@@ -1072,7 +1012,7 @@ enum SandboxCommands {
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Optional sandbox name (auto-generated when omitted).
-        #[arg(long)]
+        #[arg(long, add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
         /// Sandbox source: a community sandbox name (e.g., `openclaw`), a path
@@ -1083,8 +1023,8 @@ enum SandboxCommands {
         /// `ghcr.io/nvidia/openshell-community/sandboxes/<name>:latest`
         /// (override the prefix with `OPENSHELL_COMMUNITY_REGISTRY`).
         ///
-        /// When given a Dockerfile or directory, the image is built and pushed
-        /// into the cluster automatically before creating the sandbox.
+        /// When given a Dockerfile or directory, the image is built into the
+        /// local Docker daemon before creating the sandbox.
         #[arg(long, value_hint = ValueHint::AnyPath)]
         from: Option<String>,
 
@@ -1116,24 +1056,15 @@ enum SandboxCommands {
         editor: Option<CliEditor>,
 
         /// Request GPU resources for the sandbox.
-        ///
-        /// When no gateway is running, auto-bootstrap starts a GPU-enabled
-        /// gateway using the same automatic injection selection as
-        /// `openshell gateway start --gpu`. GPU intent is also inferred
-        /// automatically for known GPU-designated image names such as
-        /// `nvidia-gpu`.
+        /// GPU intent is also inferred automatically for known GPU-designated
+        /// image names such as `nvidia-gpu`.
         #[arg(long)]
         gpu: bool,
 
-        /// SSH destination for remote bootstrap (e.g., user@hostname).
-        /// Only used when no cluster exists yet; ignored if a cluster is
-        /// already active.
-        #[arg(long, help_heading = "BOOTSTRAP FLAGS")]
-        remote: Option<String>,
-
-        /// Path to SSH private key for remote bootstrap.
-        #[arg(long, value_hint = ValueHint::FilePath, help_heading = "BOOTSTRAP FLAGS")]
-        ssh_key: Option<String>,
+        /// Target a specific GPU by PCI address (e.g. "0000:2d:00.0") or index (e.g. "0", "1").
+        /// Only valid with --gpu. When omitted with --gpu, the first available GPU is assigned.
+        #[arg(long, requires = "gpu")]
+        gpu_device: Option<String>,
 
         /// Provider names to attach to this sandbox.
         #[arg(long = "provider")]
@@ -1145,7 +1076,7 @@ enum SandboxCommands {
         policy: Option<String>,
 
         /// Forward a local port to the sandbox before the initial command or shell starts.
-        /// Accepts [bind_address:]port (e.g. 8080, 0.0.0.0:8080). Keeps the sandbox alive.
+        /// Accepts [`bind_address`:]port (e.g. 8080, 0.0.0.0:8080). Keeps the sandbox alive.
         #[arg(long, conflicts_with = "no_keep")]
         forward: Option<String>,
 
@@ -1160,19 +1091,6 @@ enum SandboxCommands {
         #[arg(long, overrides_with = "tty")]
         no_tty: bool,
 
-        /// Auto-bootstrap a gateway if none is available (this is the default).
-        #[arg(
-            long,
-            overrides_with = "no_bootstrap",
-            help_heading = "BOOTSTRAP FLAGS",
-            hide = true
-        )]
-        bootstrap: bool,
-
-        /// Never bootstrap a gateway automatically; error if none is available.
-        #[arg(long, overrides_with = "bootstrap", help_heading = "BOOTSTRAP FLAGS")]
-        no_bootstrap: bool,
-
         /// Auto-create missing providers from local credentials.
         ///
         /// Without this flag, an interactive prompt asks per-provider;
@@ -1184,8 +1102,12 @@ enum SandboxCommands {
         #[arg(long, overrides_with = "auto_providers")]
         no_auto_providers: bool,
 
+        /// Attach labels to the sandbox (key=value format, repeatable).
+        #[arg(long = "label")]
+        labels: Vec<String>,
+
         /// Command to run after "--" (defaults to an interactive shell).
-        #[arg(trailing_var_arg = true)]
+        #[arg(last = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
 
@@ -1195,6 +1117,10 @@ enum SandboxCommands {
         /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
+
+        /// Print only the active policy YAML (same policy as the default view; stdout only).
+        #[arg(long)]
+        policy_only: bool,
     },
 
     /// List sandboxes.
@@ -1215,6 +1141,10 @@ enum SandboxCommands {
         /// Print only sandbox names (one per line).
         #[arg(long, conflicts_with = "ids")]
         names: bool,
+
+        /// Filter sandboxes by label selector (key1=value1,key2=value2).
+        #[arg(long)]
+        selector: Option<String>,
     },
 
     /// Delete a sandbox by name.
@@ -1227,6 +1157,48 @@ enum SandboxCommands {
         /// Delete all sandboxes.
         #[arg(long, conflicts_with = "names")]
         all: bool,
+    },
+
+    /// Execute a command in a running sandbox.
+    ///
+    /// Runs a command inside an existing sandbox using the gRPC exec endpoint.
+    /// Output is streamed to the terminal in real-time. The CLI exits with the
+    /// remote command's exit code.
+    ///
+    /// For interactive shell sessions, use `sandbox connect` instead.
+    ///
+    /// Examples:
+    ///   openshell sandbox exec --name my-sandbox -- ls -la /workspace
+    ///   openshell sandbox exec -n my-sandbox --workdir /app -- python script.py
+    ///   echo "hello" | openshell sandbox exec -n my-sandbox -- cat
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Exec {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(long, short = 'n', add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Working directory inside the sandbox.
+        #[arg(long)]
+        workdir: Option<String>,
+
+        /// Timeout in seconds (0 = no timeout).
+        #[arg(long, default_value_t = 0)]
+        timeout: u32,
+
+        /// Allocate a pseudo-terminal for the remote command.
+        /// Defaults to auto-detection (on when stdin and stdout are terminals).
+        /// Use --tty to force a PTY even when auto-detection fails, or
+        /// --no-tty to disable.
+        #[arg(long, overrides_with = "no_tty")]
+        tty: bool,
+
+        /// Disable pseudo-terminal allocation.
+        #[arg(long, overrides_with = "tty")]
+        no_tty: bool,
+
+        /// Command and arguments to execute.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
     },
 
     /// Connect to a sandbox.
@@ -1385,6 +1357,54 @@ enum PolicyCommands {
         timeout: u64,
     },
 
+    /// Incrementally update policy on a live sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Update {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement]]].
+        #[arg(long = "add-endpoint")]
+        add_endpoints: Vec<String>,
+
+        /// Remove an endpoint: host:port.
+        #[arg(long = "remove-endpoint")]
+        remove_endpoints: Vec<String>,
+
+        /// Add a REST allow rule: `host:port:METHOD:path_glob`.
+        #[arg(long = "add-allow")]
+        add_allow: Vec<String>,
+
+        /// Add a REST deny rule: `host:port:METHOD:path_glob`.
+        #[arg(long = "add-deny")]
+        add_deny: Vec<String>,
+
+        /// Remove a network rule by name.
+        #[arg(long = "remove-rule")]
+        remove_rules: Vec<String>,
+
+        /// Add binaries to each --add-endpoint rule.
+        #[arg(long = "binary", value_hint = ValueHint::FilePath)]
+        binaries: Vec<String>,
+
+        /// Override the generated rule name when exactly one --add-endpoint is provided.
+        #[arg(long = "rule-name")]
+        rule_name: Option<String>,
+
+        /// Preview the merged policy without sending it to the gateway.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Wait for the sandbox to load the policy revision.
+        #[arg(long)]
+        wait: bool,
+
+        /// Timeout for --wait in seconds.
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+    },
+
     /// Show current active policy for a sandbox or the global policy.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Get {
@@ -1431,6 +1451,30 @@ enum PolicyCommands {
         /// Skip the confirmation prompt for global policy delete.
         #[arg(long)]
         yes: bool,
+    },
+
+    /// Prove properties of a sandbox policy — or find counterexamples.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Prove {
+        /// Path to `OpenShell` sandbox policy YAML.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        policy: String,
+
+        /// Path to credential descriptor YAML.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        credentials: String,
+
+        /// Path to capability registry directory (default: bundled).
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        registry: Option<String>,
+
+        /// Path to accepted risks YAML.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        accepted_risks: Option<String>,
+
+        /// One-line-per-finding output (for demos and CI).
+        #[arg(long)]
+        compact: bool,
     },
 }
 
@@ -1502,7 +1546,7 @@ enum ForwardCommands {
     /// Start forwarding a local port to a sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Start {
-        /// Port to forward: [bind_address:]port (e.g. 8080, 0.0.0.0:8080).
+        /// Port to forward: [`bind_address`:]port (e.g. 8080, 0.0.0.0:8080).
         port: String,
 
         /// Sandbox name (defaults to last-used sandbox).
@@ -1531,6 +1575,7 @@ enum ForwardCommands {
 }
 
 #[tokio::main]
+#[allow(clippy::large_stack_frames)] // CLI dispatch holds many futures; OK at top level.
 async fn main() -> Result<()> {
     // Install the rustls crypto provider before completion runs — completers may
     // establish TLS connections to the gateway.
@@ -1541,7 +1586,8 @@ async fn main() -> Result<()> {
     CompleteEnv::with_factory(Cli::command).complete();
 
     let cli = Cli::parse();
-    let tls = TlsOptions::default();
+    let mut tls = TlsOptions::default();
+    tls.gateway_insecure = cli.gateway_insecure;
 
     // Set up logging based on verbosity
     let log_level = match cli.verbose {
@@ -1558,6 +1604,23 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Propagate verbosity to the OpenSSH LogLevel used by SSH subprocesses.
+    // Only set the env var when it hasn't been explicitly overridden by the
+    // user, so `OPENSHELL_SSH_LOG_LEVEL=DEBUG openshell ...` still wins.
+    if std::env::var("OPENSHELL_SSH_LOG_LEVEL").is_err() {
+        let ssh_log_level = match cli.verbose {
+            0 => "ERROR",
+            1 => "INFO",
+            _ => "DEBUG",
+        };
+        // SAFETY: Called early in main() before spawning async tasks that
+        // read the environment, so no concurrent readers exist.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("OPENSHELL_SSH_LOG_LEVEL", ssh_log_level);
+        }
+    }
+
     match cli.command {
         // -----------------------------------------------------------
         // Gateway commands (was `cluster` / `cluster admin`)
@@ -1565,74 +1628,39 @@ async fn main() -> Result<()> {
         Some(Commands::Gateway {
             command: Some(command),
         }) => match command {
-            GatewayCommands::Start {
-                name,
-                remote,
-                ssh_key,
-                port,
-                gateway_host,
-                recreate,
-                plaintext,
-                disable_gateway_auth,
-                registry_username,
-                registry_token,
-                gpu,
-            } => {
-                let gpu = if gpu {
-                    vec!["auto".to_string()]
-                } else {
-                    vec![]
-                };
-                run::gateway_admin_deploy(
-                    &name,
-                    remote.as_deref(),
-                    ssh_key.as_deref(),
-                    port,
-                    gateway_host.as_deref(),
-                    recreate,
-                    plaintext,
-                    disable_gateway_auth,
-                    registry_username.as_deref(),
-                    registry_token.as_deref(),
-                    gpu,
-                )
-                .await?;
-            }
-            GatewayCommands::Stop {
-                name,
-                remote,
-                ssh_key,
-            } => {
-                let name = name
-                    .or_else(|| resolve_gateway_name(&cli.gateway))
-                    .unwrap_or_else(|| "openshell".to_string());
-                run::gateway_admin_stop(&name, remote.as_deref(), ssh_key.as_deref()).await?;
-            }
-            GatewayCommands::Destroy {
-                name,
-                remote,
-                ssh_key,
-            } => {
-                let name = name
-                    .or_else(|| resolve_gateway_name(&cli.gateway))
-                    .unwrap_or_else(|| "openshell".to_string());
-                run::gateway_admin_destroy(&name, remote.as_deref(), ssh_key.as_deref()).await?;
-            }
             GatewayCommands::Add {
                 endpoint,
                 name,
                 remote,
-                ssh_key,
                 local,
+                oidc_issuer,
+                oidc_client_id,
+                oidc_audience,
+                oidc_scopes,
             } => {
                 run::gateway_add(
                     &endpoint,
                     name.as_deref(),
                     remote.as_deref(),
-                    ssh_key.as_deref(),
                     local,
+                    oidc_issuer.as_deref(),
+                    &oidc_client_id,
+                    oidc_audience.as_deref(),
+                    oidc_scopes.as_deref(),
                 )
                 .await?;
+            }
+            GatewayCommands::Remove { name } => {
+                let name = name
+                    .or_else(|| resolve_gateway_name(&cli.gateway))
+                    .ok_or_else(|| {
+                        miette::miette!(
+                            "No active gateway.\n\
+                         Specify a gateway name: openshell gateway remove <name>\n\
+                         Or list available gateways: openshell gateway select"
+                        )
+                    })?;
+                run::gateway_remove(&name)?;
             }
             GatewayCommands::Login { name } => {
                 let name = name
@@ -1646,6 +1674,18 @@ async fn main() -> Result<()> {
                     })?;
                 run::gateway_login(&name).await?;
             }
+            GatewayCommands::Logout { name } => {
+                let name = name
+                    .or_else(|| resolve_gateway_name(&cli.gateway))
+                    .ok_or_else(|| {
+                        miette::miette!(
+                            "No active gateway.\n\
+                             Specify a gateway name: openshell gateway logout <name>\n\
+                             Or set one with: openshell gateway select <name>"
+                        )
+                    })?;
+                run::gateway_logout(&name)?;
+            }
             GatewayCommands::Select { name } => {
                 run::gateway_select(name.as_deref(), &cli.gateway)?;
             }
@@ -1655,6 +1695,9 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|| "openshell".to_string());
                 run::gateway_admin_info(&name)?;
             }
+            GatewayCommands::List => {
+                run::gateway_list(&cli.gateway)?;
+            }
         },
 
         // -----------------------------------------------------------
@@ -1663,34 +1706,8 @@ async fn main() -> Result<()> {
         Some(Commands::Doctor {
             command: Some(command),
         }) => match command {
-            DoctorCommands::Logs {
-                name,
-                lines,
-                tail,
-                remote,
-                ssh_key,
-            } => {
-                let name = name
-                    .or_else(|| resolve_gateway_name(&cli.gateway))
-                    .unwrap_or_else(|| "openshell".to_string());
-                run::doctor_logs(&name, lines, tail, remote.as_deref(), ssh_key.as_deref()).await?;
-            }
-            DoctorCommands::Exec {
-                name,
-                remote,
-                ssh_key,
-                command,
-            } => {
-                let name = name
-                    .or_else(|| resolve_gateway_name(&cli.gateway))
-                    .unwrap_or_else(|| "openshell".to_string());
-                run::doctor_exec(&name, remote.as_deref(), ssh_key.as_deref(), &command)?;
-            }
-            DoctorCommands::LlmTxt => {
-                run::doctor_llm()?;
-            }
             DoctorCommands::Check => {
-                run::doctor_check().await?;
+                run::doctor_check()?;
             }
         },
         Some(Commands::Doctor { command: None }) => {
@@ -1707,16 +1724,16 @@ async fn main() -> Result<()> {
         Some(Commands::Status) => {
             if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
                 let mut tls = tls.with_gateway_name(&ctx.name);
-                apply_edge_auth(&mut tls, &ctx.name);
+                apply_auth(&mut tls, &ctx.name);
                 run::gateway_status(&ctx.name, &ctx.endpoint, &tls).await?;
             } else {
                 println!("{}", "Gateway Status".cyan().bold());
                 println!();
-                println!("  {} No gateway configured.", "Status:".dimmed(),);
+                println!("  {} No gateway configured.", "Status:".dimmed());
                 println!();
                 println!(
-                    "Deploy a gateway with: {}",
-                    "openshell gateway start".dimmed()
+                    "Register a gateway with: {}",
+                    "openshell gateway add <endpoint>".dimmed()
                 );
             }
         }
@@ -1730,16 +1747,15 @@ async fn main() -> Result<()> {
             ForwardCommands::Stop { port, name } => {
                 let name = match name {
                     Some(n) => n,
-                    None => match run::find_forward_by_port(port)? {
-                        Some(n) => {
+                    None => {
+                        if let Some(n) = run::find_forward_by_port(port)? {
                             eprintln!("→ Found forward on sandbox '{n}'");
                             n
-                        }
-                        None => {
-                            eprintln!("{} No active forward found for port {port}", "!".yellow(),);
+                        } else {
+                            eprintln!("{} No active forward found for port {port}", "!".yellow());
                             return Ok(());
                         }
-                    },
+                    }
                 };
                 if run::stop_forward(&name, port)? {
                     eprintln!(
@@ -1806,7 +1822,7 @@ async fn main() -> Result<()> {
                 let spec = openshell_core::forward::ForwardSpec::parse(&port)?;
                 let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                 let mut tls = tls.with_gateway_name(&ctx.name);
-                apply_edge_auth(&mut tls, &ctx.name);
+                apply_auth(&mut tls, &ctx.name);
                 let name = resolve_sandbox_name(name, &ctx.name)?;
                 run::sandbox_forward(&ctx.endpoint, &name, &spec, background, &tls).await?;
                 if background {
@@ -1834,7 +1850,7 @@ async fn main() -> Result<()> {
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_edge_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name);
             let name = resolve_sandbox_name(name, &ctx.name)?;
             run::sandbox_logs(
                 &ctx.endpoint,
@@ -1853,11 +1869,33 @@ async fn main() -> Result<()> {
         // Top-level policy (was `sandbox policy`)
         // -----------------------------------------------------------
         Some(Commands::Policy {
+            command:
+                Some(PolicyCommands::Prove {
+                    policy,
+                    credentials,
+                    registry,
+                    accepted_risks,
+                    compact,
+                }),
+        }) => {
+            // Prove runs locally — no gateway needed.
+            let exit_code = openshell_prover::prove(
+                &policy,
+                &credentials,
+                registry.as_deref(),
+                accepted_risks.as_deref(),
+                compact,
+            )?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
+        Some(Commands::Policy {
             command: Some(policy_cmd),
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_edge_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name);
             match policy_cmd {
                 PolicyCommands::Set {
                     name,
@@ -1888,6 +1926,37 @@ async fn main() -> Result<()> {
                         run::sandbox_policy_set(&ctx.endpoint, &name, &policy, wait, timeout, &tls)
                             .await?;
                     }
+                }
+                PolicyCommands::Update {
+                    name,
+                    add_endpoints,
+                    remove_endpoints,
+                    add_allow,
+                    add_deny,
+                    remove_rules,
+                    binaries,
+                    rule_name,
+                    dry_run,
+                    wait,
+                    timeout,
+                } => {
+                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    run::sandbox_policy_update(
+                        &ctx.endpoint,
+                        &name,
+                        &add_endpoints,
+                        &remove_endpoints,
+                        &add_deny,
+                        &add_allow,
+                        &remove_rules,
+                        &binaries,
+                        rule_name.as_deref(),
+                        dry_run,
+                        wait,
+                        timeout,
+                        &tls,
+                    )
+                    .await?;
                 }
                 PolicyCommands::Get {
                     name,
@@ -1922,6 +1991,7 @@ async fn main() -> Result<()> {
                     }
                     run::gateway_setting_delete(&ctx.endpoint, "policy", yes, &tls).await?;
                 }
+                PolicyCommands::Prove { .. } => unreachable!(),
             }
         }
 
@@ -1933,7 +2003,7 @@ async fn main() -> Result<()> {
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_edge_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name);
 
             match settings_cmd {
                 SettingsCommands::Get { name, global, json } => {
@@ -1987,7 +2057,7 @@ async fn main() -> Result<()> {
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_edge_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name);
             match draft_cmd {
                 DraftCommands::Get { name, status } => {
                     let name = resolve_sandbox_name(name, &ctx.name)?;
@@ -2040,7 +2110,7 @@ async fn main() -> Result<()> {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_edge_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name);
             match command {
                 InferenceCommands::Set {
                     provider,
@@ -2097,17 +2167,15 @@ async fn main() -> Result<()> {
                     no_keep,
                     editor,
                     gpu,
-                    remote,
-                    ssh_key,
+                    gpu_device,
                     providers,
                     policy,
                     forward,
                     tty,
                     no_tty,
-                    bootstrap,
-                    no_bootstrap,
                     auto_providers,
                     no_auto_providers,
+                    labels,
                     command,
                 } => {
                     // Resolve --tty / --no-tty into an Option<bool> override.
@@ -2119,16 +2187,6 @@ async fn main() -> Result<()> {
                         None // auto-detect
                     };
 
-                    // Resolve --bootstrap / --no-bootstrap into an Option<bool>.
-                    // Bootstrap is the default; --no-bootstrap opts out.
-                    let bootstrap_override = if no_bootstrap {
-                        Some(false)
-                    } else if bootstrap {
-                        Some(true)
-                    } else {
-                        None // auto-bootstrap (default)
-                    };
-
                     // Resolve --auto-providers / --no-auto-providers.
                     let auto_providers_override = if no_auto_providers {
                         Some(false)
@@ -2137,6 +2195,19 @@ async fn main() -> Result<()> {
                     } else {
                         None // prompt or auto-detect
                     };
+
+                    // Parse --label flags into a HashMap<String, String>.
+                    let mut labels_map = std::collections::HashMap::new();
+                    for label_str in &labels {
+                        let parts: Vec<&str> = label_str.splitn(2, '=').collect();
+                        if parts.len() != 2 {
+                            return Err(miette::miette!(
+                                "invalid label format '{}', expected key=value",
+                                label_str
+                            ));
+                        }
+                        labels_map.insert(parts[0].to_string(), parts[1].to_string());
+                    }
 
                     // Parse --upload spec into (local_path, sandbox_path, git_ignore).
                     let upload_spec = upload.as_deref().map(|s| {
@@ -2150,70 +2221,30 @@ async fn main() -> Result<()> {
                         .transpose()?;
                     let keep = keep || !no_keep || editor.is_some() || forward.is_some();
 
-                    // For `sandbox create`, a missing cluster is not fatal — the
-                    // bootstrap flow inside `sandbox_create` can deploy one.
-                    match resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
-                        Ok(ctx) => {
-                            if remote.is_some() {
-                                eprintln!(
-                                    "{} --remote ignored: gateway '{}' is already active. \
-                                     To redeploy, use: openshell gateway start",
-                                    "!".yellow(),
-                                    ctx.name,
-                                );
-                                return Ok(());
-                            }
-                            let endpoint = &ctx.endpoint;
-                            let mut tls = tls.with_gateway_name(&ctx.name);
-                            apply_edge_auth(&mut tls, &ctx.name);
-                            // The user already has a configured gateway. Disable
-                            // auto-bootstrap in the retry path so we don't
-                            // silently replace their selected gateway with a new
-                            // "openshell" gateway if the connection fails.
-                            Box::pin(run::sandbox_create(
-                                endpoint,
-                                name.as_deref(),
-                                from.as_deref(),
-                                &ctx.name,
-                                upload_spec.as_ref(),
-                                keep,
-                                gpu,
-                                editor,
-                                remote.as_deref(),
-                                ssh_key.as_deref(),
-                                &providers,
-                                policy.as_deref(),
-                                forward,
-                                &command,
-                                tty_override,
-                                Some(false),
-                                auto_providers_override,
-                                &tls,
-                            ))
-                            .await?;
-                        }
-                        Err(_) => {
-                            // No gateway configured — go straight to bootstrap.
-                            Box::pin(run::sandbox_create_with_bootstrap(
-                                name.as_deref(),
-                                from.as_deref(),
-                                upload_spec.as_ref(),
-                                keep,
-                                gpu,
-                                editor,
-                                remote.as_deref(),
-                                ssh_key.as_deref(),
-                                &providers,
-                                policy.as_deref(),
-                                forward,
-                                &command,
-                                tty_override,
-                                bootstrap_override,
-                                auto_providers_override,
-                            ))
-                            .await?;
-                        }
-                    }
+                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let endpoint = &ctx.endpoint;
+                    let mut tls = tls.with_gateway_name(&ctx.name);
+                    apply_auth(&mut tls, &ctx.name);
+                    Box::pin(run::sandbox_create(
+                        endpoint,
+                        name.as_deref(),
+                        from.as_deref(),
+                        &ctx.name,
+                        upload_spec.as_ref(),
+                        keep,
+                        gpu,
+                        gpu_device.as_deref(),
+                        editor,
+                        &providers,
+                        policy.as_deref(),
+                        forward,
+                        &command,
+                        tty_override,
+                        auto_providers_override,
+                        &labels_map,
+                        &tls,
+                    ))
+                    .await?;
                 }
                 SandboxCommands::Upload {
                     name,
@@ -2223,7 +2254,7 @@ async fn main() -> Result<()> {
                 } => {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
-                    apply_edge_auth(&mut tls, &ctx.name);
+                    apply_auth(&mut tls, &ctx.name);
                     let sandbox_dest = dest.as_deref();
                     let local = std::path::Path::new(&local_path);
                     if !local.exists() {
@@ -2240,6 +2271,7 @@ async fn main() -> Result<()> {
                             &name,
                             &base_dir,
                             &files,
+                            local,
                             sandbox_dest,
                             &tls,
                         )
@@ -2258,7 +2290,7 @@ async fn main() -> Result<()> {
                 } => {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
-                    apply_edge_auth(&mut tls, &ctx.name);
+                    apply_auth(&mut tls, &ctx.name);
                     let local_dest = std::path::Path::new(dest.as_deref().unwrap_or("."));
                     eprintln!(
                         "Downloading sandbox:{} -> {}",
@@ -2273,24 +2305,34 @@ async fn main() -> Result<()> {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
-                    apply_edge_auth(&mut tls, &ctx.name);
+                    apply_auth(&mut tls, &ctx.name);
                     match other {
                         SandboxCommands::Create { .. }
                         | SandboxCommands::Upload { .. }
                         | SandboxCommands::Download { .. } => {
                             unreachable!()
                         }
-                        SandboxCommands::Get { name } => {
+                        SandboxCommands::Get { name, policy_only } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
-                            run::sandbox_get(endpoint, &name, &tls).await?;
+                            run::sandbox_get(endpoint, &name, policy_only, &tls).await?;
                         }
                         SandboxCommands::List {
                             limit,
                             offset,
                             ids,
                             names,
+                            selector,
                         } => {
-                            run::sandbox_list(endpoint, limit, offset, ids, names, &tls).await?;
+                            run::sandbox_list(
+                                endpoint,
+                                limit,
+                                offset,
+                                ids,
+                                names,
+                                selector.as_deref(),
+                                &tls,
+                            )
+                            .await?;
                         }
                         SandboxCommands::Delete { names, all } => {
                             run::sandbox_delete(endpoint, &names, all, &tls, &ctx.name).await?;
@@ -2307,6 +2349,38 @@ async fn main() -> Result<()> {
                             }
                             let _ = save_last_sandbox(&ctx.name, &name);
                         }
+                        SandboxCommands::Exec {
+                            name,
+                            workdir,
+                            timeout,
+                            tty,
+                            no_tty,
+                            command,
+                        } => {
+                            let name = resolve_sandbox_name(name, &ctx.name)?;
+                            // Resolve --tty / --no-tty into an Option<bool> override.
+                            let tty_override = if no_tty {
+                                Some(false)
+                            } else if tty {
+                                Some(true)
+                            } else {
+                                None // auto-detect
+                            };
+                            let exit_code = run::sandbox_exec_grpc(
+                                endpoint,
+                                &name,
+                                &command,
+                                workdir.as_deref(),
+                                timeout,
+                                tty_override,
+                                &tls,
+                            )
+                            .await?;
+                            let _ = save_last_sandbox(&ctx.name, &name);
+                            if exit_code != 0 {
+                                std::process::exit(exit_code);
+                            }
+                        }
                         SandboxCommands::SshConfig { name } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
                             run::print_ssh_config(&ctx.name, &name);
@@ -2321,7 +2395,7 @@ async fn main() -> Result<()> {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_edge_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name);
 
             match command {
                 ProviderCommands::Create {
@@ -2352,6 +2426,35 @@ async fn main() -> Result<()> {
                 } => {
                     run::provider_list(endpoint, limit, offset, names, &tls).await?;
                 }
+                ProviderCommands::ListProfiles { output } => {
+                    run::provider_list_profiles(endpoint, output.as_str(), &tls).await?;
+                }
+                ProviderCommands::Profile(command) => match command {
+                    ProviderProfileCommands::Export { id, output } => {
+                        run::provider_profile_export(endpoint, &id, output.as_str(), &tls).await?;
+                    }
+                    ProviderProfileCommands::Import { file, from } => {
+                        run::provider_profile_import(
+                            endpoint,
+                            file.as_deref(),
+                            from.as_deref(),
+                            &tls,
+                        )
+                        .await?;
+                    }
+                    ProviderProfileCommands::Lint { file, from } => {
+                        run::provider_profile_lint(
+                            endpoint,
+                            file.as_deref(),
+                            from.as_deref(),
+                            &tls,
+                        )
+                        .await?;
+                    }
+                    ProviderProfileCommands::Delete { id } => {
+                        run::provider_profile_delete(endpoint, &id, &tls).await?;
+                    }
+                },
                 ProviderCommands::Update {
                     name,
                     from_existing,
@@ -2376,7 +2479,7 @@ async fn main() -> Result<()> {
         Some(Commands::Term { theme }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
-            apply_edge_auth(&mut tls, &ctx.name);
+            apply_auth(&mut tls, &ctx.name);
             let channel = openshell_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
             openshell_tui::run(channel, &ctx.name, &ctx.endpoint, theme).await?;
         }
@@ -2408,7 +2511,7 @@ async fn main() -> Result<()> {
                         None => tls,
                     };
                     if let Some(ref g) = gateway_name_opt {
-                        apply_edge_auth(&mut effective_tls, g);
+                        apply_auth(&mut effective_tls, g);
                     }
                     run::sandbox_ssh_proxy(&gw, &sid, &tok, &effective_tls).await?;
                 }
@@ -2420,14 +2523,14 @@ async fn main() -> Result<()> {
                         let meta = load_gateway_metadata(&g).map_err(|_| {
                             miette::miette!(
                                 "Unknown gateway '{g}'.\n\
-                                  Deploy it first: openshell gateway start --name {g}\n\
+                                  Register it first: openshell gateway add <endpoint> --name {g}\n\
                                   Or list available gateways: openshell gateway select"
                             )
                         })?;
                         meta.gateway_endpoint
                     };
                     let mut tls = tls.with_gateway_name(&g);
-                    apply_edge_auth(&mut tls, &g);
+                    apply_auth(&mut tls, &g);
                     run::sandbox_ssh_proxy_by_name(&endpoint, &n, &tls).await?;
                 }
                 // Legacy name mode with --server only (no --gateway-name).
@@ -2563,12 +2666,8 @@ mod tests {
             name: name.to_string(),
             gateway_endpoint: endpoint.to_string(),
             is_remote: true,
-            gateway_port: 0,
-            remote_host: None,
-            resolved_host: None,
             auth_mode: Some("cloudflare_jwt".to_string()),
-            edge_team_domain: None,
-            edge_auth_url: None,
+            ..Default::default()
         }
     }
 
@@ -2658,16 +2757,6 @@ mod tests {
         fs::create_dir(temp.path().join("ctx")).expect("failed to create context directory");
 
         let cases: Vec<(Vec<&str>, usize, &str)> = vec![
-            (
-                vec!["openshell", "gateway", "start", "--ssh-key", "id"],
-                4,
-                "id_rsa",
-            ),
-            (
-                vec!["openshell", "sandbox", "create", "--ssh-key", "id"],
-                4,
-                "id_rsa",
-            ),
             (
                 vec!["openshell", "sandbox", "upload", "demo", "Do"],
                 4,
@@ -2987,7 +3076,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_edge_auth_uses_stored_token() {
+    fn apply_auth_uses_stored_token() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
             store_gateway_metadata(
@@ -2998,13 +3087,13 @@ mod tests {
             store_edge_token("edge-gateway", "token-123").unwrap();
 
             let mut tls = TlsOptions::default();
-            apply_edge_auth(&mut tls, "edge-gateway");
+            apply_auth(&mut tls, "edge-gateway");
 
             assert_eq!(tls.edge_token.as_deref(), Some("token-123"));
         });
     }
 
-    /// Verify the flag names the TUI uses to build its ProxyCommand are
+    /// Verify the flag names the TUI uses to build its `ProxyCommand` are
     /// accepted by the `SshProxy` subcommand and land in the right fields.
     /// This catches drift when CLI flags are renamed or restructured.
     #[test]
@@ -3043,6 +3132,123 @@ mod tests {
                 assert_eq!(gateway_name.as_deref(), Some("my-gateway"));
             }
             other => panic!("expected SshProxy, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_list_profiles_parses() {
+        let cli = Cli::try_parse_from(["openshell", "provider", "list-profiles"])
+            .expect("provider list-profiles should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::ListProfiles {
+                    output: ProviderProfileOutput::Table
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_list_profiles_accepts_output_format() {
+        let cli = Cli::try_parse_from(["openshell", "provider", "list-profiles", "-o", "json"])
+            .expect("provider list-profiles -o json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::ListProfiles {
+                    output: ProviderProfileOutput::Json
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_profile_commands_parse() {
+        let export = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "profile",
+            "export",
+            "custom-api",
+            "-o",
+            "yaml",
+        ])
+        .expect("provider profile export should parse");
+        assert!(matches!(
+            export.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Profile(ProviderProfileCommands::Export {
+                    id,
+                    output: ProviderProfileOutput::Yaml
+                }))
+            }) if id == "custom-api"
+        ));
+
+        let import = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "profile",
+            "import",
+            "--from",
+            "./profiles",
+        ])
+        .expect("provider profile import should parse");
+        assert!(matches!(
+            import.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Profile(ProviderProfileCommands::Import {
+                    from: Some(_),
+                    ..
+                }))
+            })
+        ));
+
+        let delete =
+            Cli::try_parse_from(["openshell", "provider", "profile", "delete", "custom-api"])
+                .expect("provider profile delete should parse");
+        assert!(matches!(
+            delete.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Profile(ProviderProfileCommands::Delete {
+                    id
+                }))
+            }) if id == "custom-api"
+        ));
+    }
+
+    #[test]
+    fn provider_create_accepts_custom_profile_type_ids() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "create",
+            "--name",
+            "work-github",
+            "--type",
+            "github-readonly",
+            "--credential",
+            "GITHUB_TOKEN=token",
+        ])
+        .expect("provider create should parse custom profile ids");
+
+        match cli.command {
+            Some(Commands::Provider {
+                command:
+                    Some(ProviderCommands::Create {
+                        name,
+                        provider_type,
+                        credentials,
+                        ..
+                    }),
+            }) => {
+                assert_eq!(name, "work-github");
+                assert_eq!(provider_type, "github-readonly");
+                assert_eq!(credentials, vec!["GITHUB_TOKEN=token"]);
+            }
+            other => panic!("expected provider create command, got: {other:?}"),
         }
     }
 
@@ -3141,28 +3347,55 @@ mod tests {
         }
     }
 
-    /// Ensure every provider registered in `ProviderRegistry` has a
-    /// corresponding `CliProviderType` variant (and vice-versa).
-    /// This test would have caught the missing `Copilot` variant from #707.
+    // ── sandbox create arg-shape tests ───────────────────────────────────
+
+    /// Verify that `sandbox create --name <value>` still parses as a named
+    /// option rather than a positional argument.  The `ArgValueCompleter`
+    /// attribute must be combined with `long` on the `name` field; without
+    /// `long`, clap treats the field as positional and `--name` is rejected.
     #[test]
-    fn cli_provider_types_match_registry() {
-        let registry = openshell_providers::ProviderRegistry::new();
-        let registry_types: std::collections::BTreeSet<&str> =
-            registry.known_types().into_iter().collect();
-
-        let cli_types: std::collections::BTreeSet<&str> =
-            <CliProviderType as ValueEnum>::value_variants()
-                .iter()
-                .map(CliProviderType::as_str)
-                .collect();
-
-        assert_eq!(
-            cli_types,
-            registry_types,
-            "CliProviderType variants must match ProviderRegistry.known_types(). \
-             CLI-only: {:?}, Registry-only: {:?}",
-            cli_types.difference(&registry_types).collect::<Vec<_>>(),
-            registry_types.difference(&cli_types).collect::<Vec<_>>(),
+    fn sandbox_create_name_is_a_named_flag() {
+        // Build the CLI app and try to parse `sandbox create --name foo`.
+        // `try_parse_from` returns Err if clap rejects the arguments.
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create", "--name", "my-sb"]);
+        assert!(
+            result.is_ok(),
+            "sandbox create --name should parse as a named flag: {:?}",
+            result.err()
         );
+        if let Ok(cli) = result {
+            if let Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { name, .. }),
+                ..
+            }) = cli.command
+            {
+                assert_eq!(name.as_deref(), Some("my-sb"));
+            } else {
+                panic!("expected SandboxCommands::Create");
+            }
+        }
+    }
+
+    /// Verify that `sandbox create` without `--name` still works (name is
+    /// optional and auto-generated when omitted).
+    #[test]
+    fn sandbox_create_name_is_optional() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create"]);
+        assert!(
+            result.is_ok(),
+            "sandbox create without --name should be accepted: {:?}",
+            result.err()
+        );
+        if let Ok(cli) = result {
+            if let Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { name, .. }),
+                ..
+            }) = cli.command
+            {
+                assert_eq!(name, None);
+            } else {
+                panic!("expected SandboxCommands::Create");
+            }
+        }
     }
 }

@@ -1,15 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::RemoteOptions;
 use crate::paths::{active_gateway_path, gateways_dir, last_sandbox_path};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::paths::ensure_parent_dir_restricted;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Gateway metadata stored alongside deployment info.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Gateway metadata stored for CLI endpoint resolution and authentication.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GatewayMetadata {
     /// The gateway name.
     pub name: String,
@@ -26,7 +25,8 @@ pub struct GatewayMetadata {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub resolved_host: Option<String>,
 
-    /// Auth mode: `None` or `"mtls"` = mTLS (default), `"cloudflare_jwt"` = CF JWT.
+    /// Auth mode: `None` or `"mtls"` = mTLS (default), `"plaintext"` = direct HTTP,
+    /// `"cloudflare_jwt"` = CF JWT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,
 
@@ -45,125 +45,29 @@ pub struct GatewayMetadata {
         alias = "cf_auth_url"
     )]
     pub edge_auth_url: Option<String>,
-}
 
-impl GatewayMetadata {
-    /// Extract the host portion from the stored `gateway_endpoint` URL.
-    ///
-    /// Returns `None` if the endpoint is malformed or uses a default loopback
-    /// address (`127.0.0.1`, `localhost`, `::1`) — those are never meaningful
-    /// as a `--gateway-host` override.
-    pub fn gateway_host(&self) -> Option<&str> {
-        // Endpoint format: "https://host:port" or "http://host:port"
-        let after_scheme = self
-            .gateway_endpoint
-            .strip_prefix("https://")
-            .or_else(|| self.gateway_endpoint.strip_prefix("http://"))?;
-        // Strip port suffix (":8082")
-        let host = after_scheme
-            .rsplit_once(':')
-            .map_or(after_scheme, |(h, _)| h);
-        if host.is_empty()
-            || host == "127.0.0.1"
-            || host == "localhost"
-            || host == "::1"
-            || host == "[::1]"
-        {
-            return None;
-        }
-        Some(host)
-    }
-}
+    /// OIDC issuer URL (set when `auth_mode == "oidc"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_issuer: Option<String>,
 
-pub fn create_gateway_metadata(
-    name: &str,
-    remote: Option<&RemoteOptions>,
-    port: u16,
-) -> GatewayMetadata {
-    create_gateway_metadata_with_host(name, remote, port, None, false)
-}
+    /// OIDC client ID for the CLI login flow (set when `auth_mode == "oidc"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_client_id: Option<String>,
 
-/// Create gateway metadata, optionally overriding the gateway host.
-///
-/// When `gateway_host` is `Some`, that value is used as the host portion of
-/// `gateway_endpoint` instead of the default (`127.0.0.1` for local gateways,
-/// or the resolved SSH host for remote gateways).
-///
-/// When `disable_tls` is `true`, the gateway endpoint uses the `http://`
-/// scheme instead of `https://`.  This must match the server configuration
-/// so that the CLI connects with the correct protocol.
-pub fn create_gateway_metadata_with_host(
-    name: &str,
-    remote: Option<&RemoteOptions>,
-    port: u16,
-    gateway_host: Option<&str>,
-    disable_tls: bool,
-) -> GatewayMetadata {
-    let scheme = if disable_tls { "http" } else { "https" };
+    /// OIDC audience for the resource server (API). When different from
+    /// `client_id`, the CLI requests this audience in the token exchange.
+    /// When `None`, defaults to the `client_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_audience: Option<String>,
 
-    let (gateway_endpoint, is_remote, remote_host, resolved_host) = remote.map_or_else(
-        || {
-            let host = gateway_host.map_or_else(
-                || local_gateway_host().unwrap_or_else(|| "127.0.0.1".to_string()),
-                String::from,
-            );
-            (format!("{scheme}://{host}:{port}"), false, None, None)
-        },
-        |opts| {
-            // Extract the host portion from the SSH destination, then resolve it
-            // via `ssh -G` to get the actual hostname/IP (handles SSH config aliases).
-            let ssh_host = extract_host_from_ssh_destination(&opts.destination);
-            let resolved = resolve_ssh_hostname(&ssh_host);
-            let host = gateway_host.unwrap_or(&resolved);
-            let endpoint = format!("{scheme}://{host}:{port}");
-            (
-                endpoint,
-                true,
-                Some(opts.destination.clone()),
-                Some(resolved),
-            )
-        },
-    );
+    /// Space-separated `OAuth2` scopes to request during OIDC login.
+    /// When set, tokens will include these scopes for fine-grained access control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_scopes: Option<String>,
 
-    GatewayMetadata {
-        name: name.to_string(),
-        gateway_endpoint,
-        is_remote,
-        gateway_port: port,
-        remote_host,
-        resolved_host,
-        auth_mode: None,
-        edge_team_domain: None,
-        edge_auth_url: None,
-    }
-}
-
-pub fn local_gateway_host() -> Option<String> {
-    std::env::var("DOCKER_HOST")
-        .ok()
-        .and_then(|value| local_gateway_host_from_docker_host(&value))
-}
-
-pub fn local_gateway_host_from_docker_host(docker_host: &str) -> Option<String> {
-    let target = docker_host.strip_prefix("tcp://")?;
-    let authority = target.split('/').next()?;
-    if authority.is_empty() {
-        return None;
-    }
-
-    let host = authority
-        .strip_prefix('[')
-        .map_or_else(
-            || authority.split(':').next().unwrap_or(""),
-            |rest| rest.split(']').next().unwrap_or(""),
-        )
-        .trim();
-
-    if host.is_empty() || host == "localhost" || host == "127.0.0.1" || host == "::1" {
-        return None;
-    }
-
-    Some(host.to_string())
+    /// Local VM driver state directory for standalone VM gateways.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_driver_state_dir: Option<PathBuf>,
 }
 
 fn stored_metadata_path(name: &str) -> Result<PathBuf> {
@@ -304,12 +208,11 @@ pub fn load_last_sandbox(gateway: &str) -> Option<String> {
 /// This should be called after a sandbox is deleted so that subsequent commands
 /// don't try to connect to a sandbox that no longer exists.
 pub fn clear_last_sandbox_if_matches(gateway: &str, sandbox: &str) {
-    if let Some(current) = load_last_sandbox(gateway) {
-        if current == sandbox {
-            if let Ok(path) = last_sandbox_path(gateway) {
-                let _ = std::fs::remove_file(path);
-            }
-        }
+    if let Some(current) = load_last_sandbox(gateway)
+        && current == sandbox
+        && let Ok(path) = last_sandbox_path(gateway)
+    {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -401,57 +304,6 @@ mod tests {
     }
 
     #[test]
-    fn local_gateway_metadata() {
-        let meta = create_gateway_metadata("test", None, 8080);
-        assert_eq!(meta.name, "test");
-        assert_eq!(meta.gateway_endpoint, "https://127.0.0.1:8080");
-        assert_eq!(meta.gateway_port, 8080);
-        assert!(!meta.is_remote);
-        assert!(meta.remote_host.is_none());
-        assert!(meta.resolved_host.is_none());
-    }
-
-    #[test]
-    fn local_gateway_metadata_custom_port() {
-        let meta = create_gateway_metadata("test", None, 9090);
-        assert_eq!(meta.gateway_endpoint, "https://127.0.0.1:9090");
-        assert_eq!(meta.gateway_port, 9090);
-    }
-
-    #[test]
-    fn local_gateway_host_from_docker_host_tcp_service_name() {
-        let host = local_gateway_host_from_docker_host("tcp://docker:2375");
-        assert_eq!(host.as_deref(), Some("docker"));
-    }
-
-    #[test]
-    fn local_gateway_host_from_docker_host_tcp_loopback() {
-        let host = local_gateway_host_from_docker_host("tcp://127.0.0.1:2375");
-        assert!(host.is_none());
-    }
-
-    #[test]
-    fn local_gateway_host_from_docker_host_unix_socket() {
-        let host = local_gateway_host_from_docker_host("unix:///var/run/docker.sock");
-        assert!(host.is_none());
-    }
-
-    #[test]
-    fn remote_gateway_metadata_has_resolved_host() {
-        let opts = RemoteOptions::new("user@10.0.0.5");
-        let meta = create_gateway_metadata("test", Some(&opts), 8080);
-        assert!(meta.is_remote);
-        assert_eq!(meta.remote_host.as_deref(), Some("user@10.0.0.5"));
-        // When the host is a plain IP, ssh -G should resolve it to itself
-        assert!(meta.resolved_host.is_some());
-        assert_eq!(
-            meta.gateway_endpoint,
-            format!("https://{}:8080", meta.resolved_host.as_ref().unwrap())
-        );
-        assert_eq!(meta.gateway_port, 8080);
-    }
-
-    #[test]
     fn metadata_roundtrip() {
         let meta = GatewayMetadata {
             name: "test".to_string(),
@@ -460,9 +312,7 @@ mod tests {
             gateway_port: 8080,
             remote_host: Some("user@openshell-dev".to_string()),
             resolved_host: Some("10.0.0.5".to_string()),
-            auth_mode: None,
-            edge_team_domain: None,
-            edge_auth_url: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: GatewayMetadata = serde_json::from_str(&json).unwrap();
@@ -484,112 +334,6 @@ mod tests {
         }"#;
         let parsed: GatewayMetadata = serde_json::from_str(json).unwrap();
         assert!(parsed.resolved_host.is_none());
-    }
-
-    #[test]
-    fn local_gateway_metadata_with_gateway_host_override() {
-        let meta = create_gateway_metadata_with_host(
-            "test",
-            None,
-            8080,
-            Some("host.docker.internal"),
-            false,
-        );
-        assert_eq!(meta.name, "test");
-        assert_eq!(meta.gateway_endpoint, "https://host.docker.internal:8080");
-        assert_eq!(meta.gateway_port, 8080);
-        assert!(!meta.is_remote);
-        assert!(meta.remote_host.is_none());
-        assert!(meta.resolved_host.is_none());
-    }
-
-    #[test]
-    fn local_gateway_metadata_with_no_gateway_host_override() {
-        // When gateway_host is None, behaviour matches create_gateway_metadata.
-        let meta = create_gateway_metadata_with_host("test", None, 8080, None, false);
-        assert_eq!(meta.gateway_endpoint, "https://127.0.0.1:8080");
-    }
-
-    #[test]
-    fn local_gateway_metadata_with_tls_disabled() {
-        let meta = create_gateway_metadata_with_host("test", None, 8080, None, true);
-        assert_eq!(meta.gateway_endpoint, "http://127.0.0.1:8080");
-    }
-
-    #[test]
-    fn local_gateway_metadata_with_tls_disabled_and_gateway_host() {
-        let meta = create_gateway_metadata_with_host(
-            "test",
-            None,
-            8080,
-            Some("host.docker.internal"),
-            true,
-        );
-        assert_eq!(meta.gateway_endpoint, "http://host.docker.internal:8080");
-    }
-
-    // ── GatewayMetadata::gateway_host() ──────────────────────────────
-
-    #[test]
-    fn gateway_host_returns_custom_host() {
-        let meta =
-            create_gateway_metadata_with_host("t", None, 8082, Some("host.docker.internal"), false);
-        assert_eq!(meta.gateway_host(), Some("host.docker.internal"));
-    }
-
-    #[test]
-    fn gateway_host_returns_none_for_loopback() {
-        let meta = create_gateway_metadata("t", None, 8080);
-        // Default endpoint is https://127.0.0.1:8080
-        assert_eq!(meta.gateway_host(), None);
-    }
-
-    #[test]
-    fn gateway_host_returns_none_for_localhost() {
-        let meta = GatewayMetadata {
-            name: "t".into(),
-            gateway_endpoint: "https://localhost:8080".into(),
-            is_remote: false,
-            gateway_port: 8080,
-            remote_host: None,
-            resolved_host: None,
-            auth_mode: None,
-            edge_team_domain: None,
-            edge_auth_url: None,
-        };
-        assert_eq!(meta.gateway_host(), None);
-    }
-
-    #[test]
-    fn gateway_host_returns_ip_for_remote() {
-        let meta = GatewayMetadata {
-            name: "t".into(),
-            gateway_endpoint: "https://10.0.0.5:8080".into(),
-            is_remote: true,
-            gateway_port: 8080,
-            remote_host: Some("user@10.0.0.5".into()),
-            resolved_host: Some("10.0.0.5".into()),
-            auth_mode: None,
-            edge_team_domain: None,
-            edge_auth_url: None,
-        };
-        assert_eq!(meta.gateway_host(), Some("10.0.0.5"));
-    }
-
-    #[test]
-    fn gateway_host_handles_http_scheme() {
-        let meta =
-            create_gateway_metadata_with_host("t", None, 8080, Some("host.docker.internal"), true);
-        assert_eq!(meta.gateway_host(), Some("host.docker.internal"));
-    }
-
-    #[test]
-    fn remote_gateway_metadata_with_tls_disabled() {
-        let opts = RemoteOptions::new("user@10.0.0.5");
-        let meta = create_gateway_metadata_with_host("test", Some(&opts), 8080, None, true);
-        assert!(meta.is_remote);
-        assert!(meta.gateway_endpoint.starts_with("http://"));
-        assert!(!meta.gateway_endpoint.starts_with("https://"));
     }
 
     // ── last-sandbox persistence ──────────────────────────────────────

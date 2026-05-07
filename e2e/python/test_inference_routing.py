@@ -66,7 +66,7 @@ def _upsert_managed_inference(
     base_url: str,
 ) -> None:
     provider = datamodel_pb2.Provider(
-        name=provider_name,
+        metadata=datamodel_pb2.ObjectMeta(name=provider_name),
         type=provider_type,
         credentials={credential_key: "mock"},
         config={
@@ -126,6 +126,9 @@ def _restore_cluster_inference(
     inference_client.set_cluster(
         provider_name=previous.provider_name,
         model_id=previous.model_id,
+        # Teardown restores prior shared state as-is, even if the previous
+        # route is intentionally unreachable or no longer verifiable.
+        no_verify=True,
     )
 
 

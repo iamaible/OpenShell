@@ -48,9 +48,22 @@ pub struct RegisteredSetting {
 ///    settable via `settings set`. The server validates that only registered
 ///    keys are accepted.
 /// 5. Add a unit test in this module's `tests` section to cover the new key.
+pub const PROVIDERS_V2_ENABLED_KEY: &str = "providers_v2_enabled";
+
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
-    // Production settings go here. Add entries following the steps above.
-    //
+    // Gateway-level opt-in for provider profile policy composition. Defaults
+    // to false when unset.
+    RegisteredSetting {
+        key: PROVIDERS_V2_ENABLED_KEY,
+        kind: SettingValueKind::Bool,
+    },
+    // When true the sandbox writes OCSF v1.7.0 JSONL records to
+    // `/var/log/openshell-ocsf*.log` (daily rotation, 3 files) in addition
+    // to the human-readable shorthand log. Defaults to false (no JSONL written).
+    RegisteredSetting {
+        key: "ocsf_json_enabled",
+        kind: SettingValueKind::Bool,
+    },
     // Test-only keys live behind the `dev-settings` feature flag so they
     // don't appear in production builds.
     #[cfg(feature = "dev-settings")]
@@ -94,8 +107,8 @@ pub fn parse_bool_like(raw: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind, parse_bool_like,
-        registered_keys_csv, setting_for_key,
+        PROVIDERS_V2_ENABLED_KEY, REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind,
+        parse_bool_like, registered_keys_csv, setting_for_key,
     };
 
     #[cfg(feature = "dev-settings")]
@@ -116,6 +129,13 @@ mod tests {
     fn setting_for_key_returns_none_for_reserved_policy() {
         // "policy" is intentionally excluded from the registry.
         assert!(setting_for_key("policy").is_none());
+    }
+
+    #[test]
+    fn setting_for_key_returns_providers_v2_enabled() {
+        let setting = setting_for_key(PROVIDERS_V2_ENABLED_KEY)
+            .expect("providers_v2_enabled should be registered");
+        assert_eq!(setting.kind, SettingValueKind::Bool);
     }
 
     // ---- parse_bool_like ----

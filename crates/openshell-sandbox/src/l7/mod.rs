@@ -8,7 +8,9 @@
 //! doing a raw `copy_bidirectional`. Each request within the tunnel is parsed,
 //! evaluated against OPA policy, and either forwarded or denied.
 
+pub mod graphql;
 pub mod inference;
+pub mod path;
 pub mod provider;
 pub mod relay;
 pub mod rest;
@@ -18,6 +20,7 @@ pub mod tls;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum L7Protocol {
     Rest,
+    Graphql,
     Sql,
 }
 
@@ -25,6 +28,7 @@ impl L7Protocol {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "rest" => Some(Self::Rest),
+            "graphql" => Some(Self::Graphql),
             "sql" => Some(Self::Sql),
             _ => None,
         }
@@ -57,8 +61,17 @@ pub enum EnforcementMode {
 #[derive(Debug, Clone)]
 pub struct L7EndpointConfig {
     pub protocol: L7Protocol,
+    /// Optional endpoint-level HTTP path glob used to select between L7
+    /// protocols that share the same host:port.
+    pub path: String,
     pub tls: TlsMode,
     pub enforcement: EnforcementMode,
+    /// Maximum GraphQL request body bytes to buffer for inspection.
+    pub graphql_max_body_bytes: usize,
+    /// When true, percent-encoded `/` (`%2F`) is preserved in path segments
+    /// rather than rejected at the parser. Needed by upstreams like GitLab
+    /// that embed `%2F` in namespaced project paths. Defaults to false.
+    pub allow_encoded_slash: bool,
 }
 
 /// Result of an L7 policy decision for a single request.
@@ -78,6 +91,8 @@ pub struct L7RequestInfo {
     pub target: String,
     /// Decoded query parameter multimap for REST requests.
     pub query_params: std::collections::HashMap<String, Vec<String>>,
+    /// Parsed GraphQL operation metadata for GraphQL endpoints.
+    pub graphql: Option<graphql::GraphqlRequestInfo>,
 }
 
 /// Parse an L7 endpoint config from a regorus Value (returned by Rego query).
@@ -91,17 +106,27 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let tls = match get_object_str(val, "tls").as_deref() {
         Some("skip") => TlsMode::Skip,
         Some("terminate") => {
-            tracing::warn!(
-                "'tls: terminate' is deprecated; TLS termination is now automatic. \
-                 Use 'tls: skip' to explicitly disable. This field will be removed in a future version."
-            );
+            let event = openshell_ocsf::NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(openshell_ocsf::ActivityId::Other)
+                .severity(openshell_ocsf::SeverityId::Medium)
+                .message(
+                    "'tls: terminate' is deprecated; TLS termination is now automatic. \
+                     Use 'tls: skip' to explicitly disable. This field will be removed in a future version.",
+                )
+                .build();
+            openshell_ocsf::ocsf_emit!(event);
             TlsMode::Auto
         }
         Some("passthrough") => {
-            tracing::warn!(
-                "'tls: passthrough' is deprecated; TLS termination is now automatic. \
-                 Use 'tls: skip' to explicitly disable. This field will be removed in a future version."
-            );
+            let event = openshell_ocsf::NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(openshell_ocsf::ActivityId::Other)
+                .severity(openshell_ocsf::SeverityId::Medium)
+                .message(
+                    "'tls: passthrough' is deprecated; TLS termination is now automatic. \
+                     Use 'tls: skip' to explicitly disable. This field will be removed in a future version.",
+                )
+                .build();
+            openshell_ocsf::ocsf_emit!(event);
             TlsMode::Auto
         }
         _ => TlsMode::Auto,
@@ -112,11 +137,47 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         _ => EnforcementMode::Audit,
     };
 
+    let allow_encoded_slash = get_object_bool(val, "allow_encoded_slash").unwrap_or(false);
+    let graphql_max_body_bytes = get_object_u64(val, "graphql_max_body_bytes")
+        .and_then(|v| usize::try_from(v).ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(graphql::DEFAULT_MAX_BODY_BYTES);
+
     Some(L7EndpointConfig {
         protocol,
+        path: get_object_str(val, "path").unwrap_or_default(),
         tls,
         enforcement,
+        graphql_max_body_bytes,
+        allow_encoded_slash,
     })
+}
+
+impl L7EndpointConfig {
+    pub fn matches_path(&self, path: &str) -> bool {
+        endpoint_path_matches(&self.path, path)
+    }
+
+    pub fn path_specificity(&self) -> usize {
+        if self.path.is_empty() {
+            0
+        } else {
+            self.path.chars().filter(|c| *c != '*').count()
+        }
+    }
+}
+
+pub fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
+    if pattern.is_empty() || pattern == "**" || pattern == "/**" {
+        return true;
+    }
+    if pattern == path {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix("/**") {
+        return path == prefix || path.starts_with(&format!("{prefix}/"));
+    }
+    glob::Pattern::new(pattern).is_ok_and(|glob| glob.matches(path))
 }
 
 /// Parse the `tls` field from an endpoint config, independent of L7 protocol.
@@ -126,8 +187,32 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
 pub fn parse_tls_mode(val: &regorus::Value) -> TlsMode {
     match get_object_str(val, "tls").as_deref() {
         Some("skip") => TlsMode::Skip,
-        Some("terminate") | Some("passthrough") => TlsMode::Auto, // deprecation logged by parse_l7_config
+        // "terminate" and "passthrough" are deprecated aliases (logged by parse_l7_config); fall through to Auto.
         _ => TlsMode::Auto,
+    }
+}
+
+/// Extract a bool value from a regorus object. Returns `None` when the key
+/// is absent or not a boolean.
+fn get_object_bool(val: &regorus::Value, key: &str) -> Option<bool> {
+    let key_val = regorus::Value::String(key.into());
+    match val {
+        regorus::Value::Object(map) => match map.get(&key_val) {
+            Some(regorus::Value::Bool(b)) => Some(*b),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn get_object_u64(val: &regorus::Value, key: &str) -> Option<u64> {
+    let key_val = regorus::Value::String(key.into());
+    match val {
+        regorus::Value::Object(map) => match map.get(&key_val) {
+            Some(regorus::Value::Number(n)) => n.as_u64(),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -189,6 +274,85 @@ fn check_glob_syntax(pattern: &str) -> Option<String> {
     None
 }
 
+fn validate_graphql_operation_type(
+    errors: &mut Vec<String>,
+    loc: &str,
+    value: Option<&str>,
+    required: bool,
+) {
+    let Some(value) = value.filter(|v| !v.is_empty()) else {
+        if required {
+            errors.push(format!(
+                "{loc}.operation_type: required for GraphQL L7 rules"
+            ));
+        }
+        return;
+    };
+
+    let valid = ["query", "mutation", "subscription", "*"];
+    if !valid.contains(&value.to_ascii_lowercase().as_str()) {
+        errors.push(format!(
+            "{loc}.operation_type: expected query, mutation, subscription, or *, got '{value}'"
+        ));
+    }
+}
+
+fn validate_graphql_fields(
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    loc: &str,
+    fields: Option<&serde_json::Value>,
+) {
+    let Some(fields) = fields else {
+        return;
+    };
+    let Some(items) = fields.as_array() else {
+        errors.push(format!(
+            "{loc}.fields: expected array of GraphQL root field globs"
+        ));
+        return;
+    };
+    if items.is_empty() {
+        errors.push(format!(
+            "{loc}.fields: list must not be empty; omit fields to match all root fields"
+        ));
+        return;
+    }
+    for item in items {
+        let Some(field) = item.as_str() else {
+            errors.push(format!("{loc}.fields: all values must be strings"));
+            continue;
+        };
+        if field.is_empty() {
+            errors.push(format!("{loc}.fields: field glob must not be empty"));
+        } else if let Some(warning) = check_glob_syntax(field) {
+            warnings.push(format!("{loc}.fields: {warning}"));
+        }
+    }
+}
+
+fn validate_graphql_rule(
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    loc: &str,
+    rule: &serde_json::Value,
+    required: bool,
+) {
+    validate_graphql_operation_type(
+        errors,
+        loc,
+        rule.get("operation_type").and_then(|v| v.as_str()),
+        required,
+    );
+    if let Some(name) = rule.get("operation_name").and_then(|v| v.as_str())
+        && !name.is_empty()
+        && let Some(warning) = check_glob_syntax(name)
+    {
+        warnings.push(format!("{loc}.operation_name: {warning}"));
+    }
+    validate_graphql_fields(errors, warnings, loc, rule.get("fields"));
+}
+
 /// Validate L7 policy configuration in the loaded OPA data.
 ///
 /// Returns a list of errors and warnings. Errors should prevent sandbox startup;
@@ -219,20 +383,31 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 .and_then(|v| v.as_array())
                 .is_some_and(|a| !a.is_empty());
             let host = ep.get("host").and_then(|v| v.as_str()).unwrap_or("");
+            let endpoint_path = ep.get("path").and_then(|v| v.as_str()).unwrap_or("");
 
             // Read ports from either "ports" array or scalar "port".
-            let ports: Vec<u64> = ep
-                .get("ports")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
-                .unwrap_or_else(|| {
+            let ports: Vec<u64> = ep.get("ports").and_then(|v| v.as_array()).map_or_else(
+                || {
                     ep.get("port")
                         .and_then(serde_json::Value::as_u64)
                         .filter(|p| *p > 0)
                         .into_iter()
                         .collect()
-                });
+                },
+                |arr| arr.iter().filter_map(serde_json::Value::as_u64).collect(),
+            );
             let loc = format!("{name}.endpoints[{i}]");
+
+            if !endpoint_path.is_empty() {
+                if !endpoint_path.starts_with('/') && endpoint_path != "**" {
+                    errors.push(format!(
+                        "{loc}: endpoint path must start with '/' or be '**', got '{endpoint_path}'"
+                    ));
+                }
+                if let Some(warning) = check_glob_syntax(endpoint_path) {
+                    warnings.push(format!("{loc}.path: {warning}"));
+                }
+            }
 
             // Validate host wildcard patterns.
             if host.contains('*') {
@@ -245,11 +420,14 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                         "{loc}: host wildcard must start with '*.' or '**.' (e.g., '*.example.com'), got '{host}'"
                     ));
                 } else {
-                    // Warn on very broad wildcards like *.com (2 labels)
+                    // Reject TLD wildcards like *.com (2 labels) — they are
+                    // accepted by the policy engine but silently fail at the
+                    // proxy layer (see #787).
                     let label_count = host.split('.').count();
                     if label_count <= 2 {
-                        warnings.push(format!(
-                            "{loc}: host wildcard '{host}' is very broad (covers all subdomains of a TLD)"
+                        errors.push(format!(
+                            "{loc}: TLD wildcard '{host}' is not allowed; \
+                             use subdomain wildcards like '*.example.com' instead"
                         ));
                     }
                 }
@@ -280,6 +458,57 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 errors.push(format!(
                     "{loc}: protocol requires rules or access to define allowed traffic"
                 ));
+            }
+
+            if !protocol.is_empty() && L7Protocol::parse(protocol).is_none() {
+                errors.push(format!(
+                    "{loc}: unknown protocol '{protocol}' (expected rest, graphql, or sql)"
+                ));
+            }
+
+            if let Some(mode) = ep.get("persisted_queries").and_then(|v| v.as_str())
+                && !mode.is_empty()
+                && mode != "deny"
+                && mode != "allow_registered"
+            {
+                errors.push(format!(
+                    "{loc}: persisted_queries must be 'deny' or 'allow_registered', got '{mode}'"
+                ));
+            }
+
+            if ep.get("graphql_max_body_bytes").is_some() {
+                let valid_max = ep
+                    .get("graphql_max_body_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|v| v > 0);
+                if !valid_max {
+                    errors.push(format!(
+                        "{loc}: graphql_max_body_bytes must be a positive integer"
+                    ));
+                }
+            }
+
+            if protocol != "graphql"
+                && (ep.get("persisted_queries").is_some()
+                    || ep.get("graphql_persisted_queries").is_some()
+                    || ep.get("graphql_max_body_bytes").is_some())
+            {
+                warnings.push(format!(
+                    "{loc}: GraphQL-specific endpoint fields are ignored unless protocol is graphql"
+                ));
+            }
+
+            if let Some(registry_value) = ep.get("graphql_persisted_queries") {
+                let Some(registry) = registry_value.as_object() else {
+                    errors.push(format!(
+                        "{loc}: graphql_persisted_queries must be a map keyed by hash or saved-query id"
+                    ));
+                    continue;
+                };
+                for (key, op) in registry {
+                    let registry_loc = format!("{loc}.graphql_persisted_queries[{key}]");
+                    validate_graphql_rule(&mut errors, &mut warnings, &registry_loc, op, true);
+                }
             }
 
             // Deprecated tls values: warn but don't error
@@ -317,6 +546,191 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
             // port 443 + rest + tls: skip — L7 won't work (already handled above)
             // The old warning about missing `tls: terminate` is no longer needed
             // because TLS termination is now automatic.
+
+            // Validate deny_rules
+            let has_deny_rules = ep
+                .get("deny_rules")
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| !a.is_empty());
+            if has_deny_rules {
+                // deny_rules require L7 inspection
+                if protocol.is_empty() {
+                    errors.push(format!(
+                        "{loc}: deny_rules require protocol (L7 inspection must be enabled)"
+                    ));
+                }
+
+                // deny_rules require some allow base (access or rules)
+                if !has_rules && access.is_empty() {
+                    errors.push(format!(
+                        "{loc}: deny_rules require rules or access to define the base allow set"
+                    ));
+                }
+
+                if let Some(deny_rules) = ep.get("deny_rules").and_then(|v| v.as_array()) {
+                    for (deny_idx, deny_rule) in deny_rules.iter().enumerate() {
+                        let deny_loc = format!("{loc}.deny_rules[{deny_idx}]");
+
+                        // Validate method
+                        if let Some(method) = deny_rule.get("method").and_then(|m| m.as_str())
+                            && !method.is_empty()
+                            && protocol == "rest"
+                        {
+                            let valid_methods = [
+                                "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "*",
+                            ];
+                            if !valid_methods.contains(&method.to_ascii_uppercase().as_str()) {
+                                warnings.push(format!(
+                                    "{deny_loc}: Unknown HTTP method '{method}'. Standard methods: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS."
+                                ));
+                            }
+                        }
+
+                        // Validate path glob syntax
+                        if let Some(path) = deny_rule.get("path").and_then(|p| p.as_str())
+                            && let Some(warning) = check_glob_syntax(path)
+                        {
+                            warnings.push(format!("{deny_loc}.path: {warning}"));
+                        }
+
+                        // Validate query matchers — mirrors allow-side validation exactly
+                        if let Some(query) = deny_rule.get("query").filter(|v| !v.is_null()) {
+                            let Some(query_obj) = query.as_object() else {
+                                errors.push(format!(
+                                    "{deny_loc}.query: expected map of query matchers"
+                                ));
+                                continue;
+                            };
+
+                            for (param, matcher) in query_obj {
+                                if let Some(glob_str) = matcher.as_str() {
+                                    if let Some(warning) = check_glob_syntax(glob_str) {
+                                        warnings
+                                            .push(format!("{deny_loc}.query.{param}: {warning}"));
+                                    }
+                                    continue;
+                                }
+
+                                let Some(matcher_obj) = matcher.as_object() else {
+                                    errors.push(format!(
+                                        "{deny_loc}.query.{param}: expected string glob or object with `any`"
+                                    ));
+                                    continue;
+                                };
+
+                                let has_any = matcher_obj.get("any").is_some();
+                                let has_glob = matcher_obj.get("glob").is_some();
+                                let has_unknown =
+                                    matcher_obj.keys().any(|k| k != "any" && k != "glob");
+                                if has_unknown {
+                                    errors.push(format!(
+                                        "{deny_loc}.query.{param}: unknown matcher keys; only `glob` or `any` are supported"
+                                    ));
+                                    continue;
+                                }
+
+                                if has_glob && has_any {
+                                    errors.push(format!(
+                                        "{deny_loc}.query.{param}: matcher cannot specify both `glob` and `any`"
+                                    ));
+                                    continue;
+                                }
+
+                                if !has_glob && !has_any {
+                                    errors.push(format!(
+                                        "{deny_loc}.query.{param}: object matcher requires `glob` string or non-empty `any` list"
+                                    ));
+                                    continue;
+                                }
+
+                                if has_glob {
+                                    match matcher_obj.get("glob").and_then(|v| v.as_str()) {
+                                        None => {
+                                            errors.push(format!(
+                                                "{deny_loc}.query.{param}.glob: expected glob string"
+                                            ));
+                                        }
+                                        Some(g) => {
+                                            if let Some(warning) = check_glob_syntax(g) {
+                                                warnings.push(format!(
+                                                    "{deny_loc}.query.{param}.glob: {warning}"
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+
+                                let any = matcher_obj.get("any").and_then(|v| v.as_array());
+                                let Some(any) = any else {
+                                    errors.push(format!(
+                                        "{deny_loc}.query.{param}.any: expected array of glob strings"
+                                    ));
+                                    continue;
+                                };
+
+                                if any.is_empty() {
+                                    errors.push(format!(
+                                        "{deny_loc}.query.{param}.any: list must not be empty"
+                                    ));
+                                    continue;
+                                }
+
+                                if any.iter().any(|v| v.as_str().is_none()) {
+                                    errors.push(format!(
+                                        "{deny_loc}.query.{param}.any: all values must be strings"
+                                    ));
+                                }
+
+                                for item in any.iter().filter_map(|v| v.as_str()) {
+                                    if let Some(warning) = check_glob_syntax(item) {
+                                        warnings.push(format!(
+                                            "{deny_loc}.query.{param}.any: {warning}"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+
+                        // SQL command validation
+                        if let Some(command) = deny_rule.get("command").and_then(|c| c.as_str())
+                            && !command.is_empty()
+                            && protocol == "rest"
+                        {
+                            warnings
+                                .push(format!("{deny_loc}: command is for SQL protocol, not REST"));
+                        }
+
+                        if protocol == "graphql" {
+                            validate_graphql_rule(
+                                &mut errors,
+                                &mut warnings,
+                                &deny_loc,
+                                deny_rule,
+                                true,
+                            );
+                        } else if deny_rule.get("operation_type").is_some()
+                            || deny_rule.get("operation_name").is_some()
+                            || deny_rule.get("fields").is_some()
+                        {
+                            warnings.push(format!(
+                                "{deny_loc}: GraphQL rule fields are ignored unless protocol is graphql"
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Empty deny_rules list (explicitly set but empty)
+            if ep
+                .get("deny_rules")
+                .and_then(|v| v.as_array())
+                .is_some_and(Vec::is_empty)
+            {
+                errors.push(format!(
+                    "{loc}: deny_rules list cannot be empty (would have no effect). Remove it if no denials are needed."
+                ));
+            }
 
             // Validate HTTP methods in rules
             if has_rules && protocol == "rest" {
@@ -443,6 +857,17 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                     }
                 }
             }
+
+            if has_rules
+                && protocol == "graphql"
+                && let Some(rules) = ep.get("rules").and_then(|v| v.as_array())
+            {
+                for (rule_idx, rule) in rules.iter().enumerate() {
+                    let allow = rule.get("allow").unwrap_or(rule);
+                    let rule_loc = format!("{loc}.rules[{rule_idx}].allow");
+                    validate_graphql_rule(&mut errors, &mut warnings, &rule_loc, allow, true);
+                }
+            }
         }
     }
 
@@ -485,22 +910,35 @@ pub fn expand_access_presets(data: &mut serde_json::Value) {
                 continue;
             }
 
-            let rules = match access.as_str() {
-                "read-only" => vec![
-                    rule_json("GET", "**"),
-                    rule_json("HEAD", "**"),
-                    rule_json("OPTIONS", "**"),
-                ],
-                "read-write" => vec![
-                    rule_json("GET", "**"),
-                    rule_json("HEAD", "**"),
-                    rule_json("OPTIONS", "**"),
-                    rule_json("POST", "**"),
-                    rule_json("PUT", "**"),
-                    rule_json("PATCH", "**"),
-                ],
-                "full" => vec![rule_json("*", "**")],
-                _ => continue,
+            let protocol = ep
+                .get("protocol")
+                .and_then(|v| v.as_str())
+                .unwrap_or("rest");
+            let rules = if protocol == "graphql" {
+                match access.as_str() {
+                    "read-only" => vec![graphql_rule_json("query")],
+                    "read-write" => vec![graphql_rule_json("query"), graphql_rule_json("mutation")],
+                    "full" => vec![graphql_rule_json("*")],
+                    _ => continue,
+                }
+            } else {
+                match access.as_str() {
+                    "read-only" => vec![
+                        rule_json("GET", "**"),
+                        rule_json("HEAD", "**"),
+                        rule_json("OPTIONS", "**"),
+                    ],
+                    "read-write" => vec![
+                        rule_json("GET", "**"),
+                        rule_json("HEAD", "**"),
+                        rule_json("OPTIONS", "**"),
+                        rule_json("POST", "**"),
+                        rule_json("PUT", "**"),
+                        rule_json("PATCH", "**"),
+                    ],
+                    "full" => vec![rule_json("*", "**")],
+                    _ => continue,
+                }
             };
 
             ep.as_object_mut()
@@ -515,6 +953,14 @@ fn rule_json(method: &str, path: &str) -> serde_json::Value {
         "allow": {
             "method": method,
             "path": path
+        }
+    })
+}
+
+fn graphql_rule_json(operation_type: &str) -> serde_json::Value {
+    serde_json::json!({
+        "allow": {
+            "operation_type": operation_type
         }
     })
 }
@@ -563,6 +1009,26 @@ mod tests {
         let val =
             regorus::Value::from_json_str(r#"{"host": "api.example.com", "port": 443}"#).unwrap();
         assert!(parse_l7_config(&val).is_none());
+    }
+
+    #[test]
+    fn parse_l7_config_allow_encoded_slash_defaults_false() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "host": "api.example.com", "port": 443}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert!(!config.allow_encoded_slash);
+    }
+
+    #[test]
+    fn parse_l7_config_allow_encoded_slash_opt_in() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "host": "gitlab.example.com", "port": 443, "allow_encoded_slash": true}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert!(config.allow_encoded_slash);
     }
 
     #[test]
@@ -756,6 +1222,81 @@ mod tests {
     }
 
     #[test]
+    fn expand_graphql_readonly_preset() {
+        let mut data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "graphql",
+                        "access": "read-only"
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        expand_access_presets(&mut data);
+        let rules = data["network_policies"]["test"]["endpoints"][0]["rules"]
+            .as_array()
+            .unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0]["allow"]["operation_type"].as_str().unwrap(),
+            "query"
+        );
+    }
+
+    #[test]
+    fn validate_graphql_rule_requires_operation_type() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "graphql",
+                        "rules": [{
+                            "allow": {
+                                "fields": ["viewer"]
+                            }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| e.contains("operation_type")),
+            "GraphQL rules should require operation_type: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_graphql_persisted_query_mode() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "graphql",
+                        "access": "full",
+                        "persisted_queries": "allow_all"
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| e.contains("persisted_queries")),
+            "invalid persisted query mode should be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
     fn l4_only_endpoint_untouched() {
         let mut data = serde_json::json!({
             "network_policies": {
@@ -839,7 +1380,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_wildcard_host_broad_warning() {
+    fn validate_wildcard_host_tld_rejected() {
         let data = serde_json::json!({
             "network_policies": {
                 "test": {
@@ -851,11 +1392,30 @@ mod tests {
                 }
             }
         });
-        let (errors, warnings) = validate_l7_policies(&data);
-        assert!(errors.is_empty(), "*.com should not error: {errors:?}");
+        let (errors, _warnings) = validate_l7_policies(&data);
         assert!(
-            warnings.iter().any(|w| w.contains("very broad")),
-            "*.com should warn about breadth, got warnings: {warnings:?}"
+            errors.iter().any(|e| e.contains("TLD wildcard")),
+            "*.com should be rejected as TLD wildcard, got errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_wildcard_host_double_star_tld_rejected() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "**.org",
+                        "port": 443
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| e.contains("TLD wildcard")),
+            "**.org should be rejected as TLD wildcard, got errors: {errors:?}"
         );
     }
 
@@ -1127,6 +1687,195 @@ mod tests {
         assert!(
             errors.is_empty(),
             "valid query matcher shapes should not error: {errors:?}"
+        );
+    }
+
+    // --- Deny rules validation tests ---
+
+    #[test]
+    fn validate_deny_rules_require_protocol() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "deny_rules": [{ "method": "POST", "path": "/admin" }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("deny_rules require protocol")),
+            "should require protocol for deny_rules: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_deny_rules_require_allow_base() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "rest",
+                        "deny_rules": [{ "method": "POST", "path": "/admin" }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("deny_rules require rules or access")),
+            "should require rules or access for deny_rules: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_deny_rules_empty_list_rejected() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "rest",
+                        "access": "full",
+                        "deny_rules": []
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("deny_rules list cannot be empty")),
+            "should reject empty deny_rules: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_deny_rules_valid_config_accepted() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "rest",
+                        "access": "read-write",
+                        "deny_rules": [
+                            { "method": "POST", "path": "/repos/*/pulls/*/reviews" },
+                            { "method": "PUT", "path": "/repos/*/branches/*/protection" }
+                        ]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors.is_empty(),
+            "valid deny_rules should not error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_deny_rules_query_empty_any_rejected() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "rest",
+                        "access": "full",
+                        "deny_rules": [{
+                            "method": "POST",
+                            "path": "/admin",
+                            "query": { "type": { "any": [] } }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("any: list must not be empty")),
+            "should reject empty any list in deny query: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_deny_rules_query_non_string_rejected() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "rest",
+                        "access": "full",
+                        "deny_rules": [{
+                            "method": "POST",
+                            "path": "/admin",
+                            "query": { "force": 123 }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("expected string glob or object")),
+            "should reject non-string/non-object matcher in deny query: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_deny_rules_query_valid_matchers_accepted() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "rest",
+                        "access": "full",
+                        "deny_rules": [{
+                            "method": "POST",
+                            "path": "/admin/**",
+                            "query": {
+                                "force": "true",
+                                "type": { "any": ["admin-*", "root-*"] },
+                                "scope": { "glob": "org-*" }
+                            }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors.is_empty(),
+            "valid deny query matchers should not error: {errors:?}"
         );
     }
 }

@@ -8,11 +8,12 @@
 //! and chunked transfer encoding for body framing.
 
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
+use crate::opa::PolicyGenerationGuard;
 use crate::secrets::rewrite_http_header_block;
 use miette::{IntoDiagnostic, Result, miette};
 use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::{debug, warn};
+use tracing::debug;
 
 const MAX_HEADER_BYTES: usize = 16384; // 16 KiB for HTTP headers
 const RELAY_BUF_SIZE: usize = 8192;
@@ -22,14 +23,33 @@ const RELAY_BUF_SIZE: usize = 8192;
 const RELAY_EOF_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// HTTP/1.1 REST protocol provider.
-pub struct RestProvider;
+///
+/// Carries the path-canonicalization options derived from the endpoint
+/// config so that different endpoints (e.g. one backed by GitLab that needs
+/// `%2F` in paths and one backed by a strict API) can apply different
+/// canonicalization strictness to the same `RestProvider` call surface.
+#[derive(Debug, Clone, Default)]
+pub struct RestProvider {
+    canonicalize_options: crate::l7::path::CanonicalizeOptions,
+}
+
+impl RestProvider {
+    /// Construct a provider with explicit canonicalization options. Used by
+    /// `relay_rest` so endpoint config can opt in to looser behavior such
+    /// as `allow_encoded_slash`.
+    pub fn with_options(canonicalize_options: crate::l7::path::CanonicalizeOptions) -> Self {
+        Self {
+            canonicalize_options,
+        }
+    }
+}
 
 impl L7Provider for RestProvider {
     async fn parse_request<C: AsyncRead + AsyncWrite + Unpin + Send>(
         &self,
         client: &mut C,
     ) -> Result<Option<L7Request>> {
-        parse_http_request(client).await
+        parse_http_request(client, &self.canonicalize_options).await
     }
 
     async fn relay<C, U>(
@@ -78,7 +98,10 @@ impl RestProvider {
 /// forwarded upstream without L7 policy evaluation -- a request
 /// smuggling vulnerability.  Byte-at-a-time overhead is negligible for
 /// the typical 200-800 byte headers on L7-inspected REST endpoints.
-async fn parse_http_request<C: AsyncRead + Unpin>(client: &mut C) -> Result<Option<L7Request>> {
+async fn parse_http_request<C: AsyncRead + Unpin>(
+    client: &mut C,
+    canonicalize_options: &crate::l7::path::CanonicalizeOptions,
+) -> Result<Option<L7Request>> {
     let mut buf = Vec::with_capacity(4096);
 
     loop {
@@ -149,15 +172,66 @@ async fn parse_http_request<C: AsyncRead + Unpin>(client: &mut C) -> Result<Opti
 
     // Determine body framing from headers
     let body_length = parse_body_length(header_str)?;
-    let (path, query_params) = parse_target_query(&target)?;
+
+    // Canonicalize the request-target before OPA evaluation AND before
+    // forwarding. This closes the parser-differential between the policy
+    // engine (which matches on segments) and the upstream server (which
+    // resolves `..` / `%2e%2e` / `%2F` before dispatch). If canonicalization
+    // fails, the request is rejected as a protocol violation — consistent
+    // with how duplicate Content-Length, bare LF, and invalid UTF-8 are
+    // handled by this parser.
+    let (canonical, raw_query) =
+        crate::l7::path::canonicalize_request_target(&target, canonicalize_options)
+            .map_err(|e| miette!("HTTP request-target rejected: {e}"))?;
+
+    let query_params = match raw_query.as_deref() {
+        Some(q) => parse_query_params(q)?,
+        None => HashMap::new(),
+    };
+
+    if canonical.rewritten {
+        buf = rewrite_request_line_target(
+            &buf,
+            &method,
+            &canonical.path,
+            raw_query.as_deref(),
+            version,
+        )?;
+    }
 
     Ok(Some(L7Request {
         action: method,
-        target: path,
+        target: canonical.path,
         query_params,
         raw_header: buf, // exact header bytes up to and including \r\n\r\n
         body_length,
     }))
+}
+
+/// Rebuild the request line in a raw HTTP header block with a canonicalized
+/// target. Called when the canonical path differs from what the client sent,
+/// so the upstream dispatches on the exact bytes the policy engine evaluated.
+fn rewrite_request_line_target(
+    raw: &[u8],
+    method: &str,
+    canonical_path: &str,
+    raw_query: Option<&str>,
+    version: &str,
+) -> Result<Vec<u8>> {
+    let eol = raw
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .ok_or_else(|| miette!("request line missing CRLF"))?;
+    let rest = &raw[eol..];
+    let new_target = match raw_query {
+        Some(q) if !q.is_empty() => format!("{canonical_path}?{q}"),
+        _ => canonical_path.to_string(),
+    };
+    let new_request_line = format!("{method} {new_target} {version}");
+    let mut out = Vec::with_capacity(new_request_line.len() + rest.len());
+    out.extend_from_slice(new_request_line.as_bytes());
+    out.extend_from_slice(rest);
+    Ok(out)
 }
 
 pub(crate) fn parse_target_query(target: &str) -> Result<(String, HashMap<String, Vec<String>>)> {
@@ -167,7 +241,7 @@ pub(crate) fn parse_target_query(target: &str) -> Result<(String, HashMap<String
     }
 }
 
-fn parse_query_params(query: &str) -> Result<HashMap<String, Vec<String>>> {
+pub(crate) fn parse_query_params(query: &str) -> Result<HashMap<String, Vec<String>>> {
     let mut params: HashMap<String, Vec<String>> = HashMap::new();
     if query.is_empty() {
         return Ok(params);
@@ -265,6 +339,20 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
+    relay_http_request_with_resolver_guarded(req, client, upstream, resolver, None).await
+}
+
+pub(crate) async fn relay_http_request_with_resolver_guarded<C, U>(
+    req: &L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    resolver: Option<&crate::secrets::SecretResolver>,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<RelayOutcome>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
     let header_end = req
         .raw_header
         .windows(4)
@@ -274,6 +362,10 @@ where
     let rewrite_result = rewrite_http_header_block(&req.raw_header[..header_end], resolver)
         .map_err(|e| miette!("credential injection failed: {e}"))?;
 
+    if let Some(guard) = generation_guard {
+        guard.ensure_current()?;
+    }
+
     upstream
         .write_all(&rewrite_result.rewritten)
         .await
@@ -281,6 +373,9 @@ where
 
     let overflow = &req.raw_header[header_end..];
     if !overflow.is_empty() {
+        if let Some(guard) = generation_guard {
+            guard.ensure_current()?;
+        }
         upstream.write_all(overflow).await.into_diagnostic()?;
     }
     let overflow_len = overflow.len() as u64;
@@ -289,11 +384,17 @@ where
         BodyLength::ContentLength(len) => {
             let remaining = len.saturating_sub(overflow_len);
             if remaining > 0 {
-                relay_fixed(client, upstream, remaining).await?;
+                relay_fixed(client, upstream, remaining, generation_guard).await?;
             }
         }
         BodyLength::Chunked => {
-            relay_chunked(client, upstream, &req.raw_header[header_end..]).await?;
+            relay_chunked(
+                client,
+                upstream,
+                &req.raw_header[header_end..],
+                generation_guard,
+            )
+            .await?;
         }
         BodyLength::None => {}
     }
@@ -309,10 +410,30 @@ where
     if matches!(outcome, RelayOutcome::Upgraded { .. }) {
         let header_str = String::from_utf8_lossy(&req.raw_header[..header_end]);
         if !client_requested_upgrade(&header_str) {
-            warn!(
-                method = %req.action,
-                target = %req.target,
-                "upstream sent unsolicited 101 without client Upgrade request — closing connection"
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::DetectionFindingBuilder::new(crate::ocsf_ctx())
+                    .activity(openshell_ocsf::ActivityId::Open)
+                    .action(openshell_ocsf::ActionId::Denied)
+                    .disposition(openshell_ocsf::DispositionId::Blocked)
+                    .severity(openshell_ocsf::SeverityId::High)
+                    .confidence(openshell_ocsf::ConfidenceId::High)
+                    .is_alert(true)
+                    .finding_info(
+                        openshell_ocsf::FindingInfo::new(
+                            "unsolicited-101-upgrade",
+                            "Unsolicited 101 Switching Protocols",
+                        )
+                        .with_desc(&format!(
+                            "Upstream sent 101 without client Upgrade request for {} {} — \
+                             possible L7 inspection bypass. Connection closed.",
+                            req.action, req.target,
+                        )),
+                    )
+                    .message(format!(
+                        "Unsolicited 101 upgrade blocked: {} {}",
+                        req.action, req.target,
+                    ))
+                    .build()
             );
             return Ok(RelayOutcome::Consumed);
         }
@@ -365,7 +486,7 @@ async fn send_deny_response<C: AsyncWrite + Unpin>(
 /// Per RFC 7230 Section 3.3.3, rejects requests containing both
 /// `Content-Length` and `Transfer-Encoding` headers to prevent request
 /// smuggling via CL/TE ambiguity.
-fn parse_body_length(headers: &str) -> Result<BodyLength> {
+pub(crate) fn parse_body_length(headers: &str) -> Result<BodyLength> {
     let mut has_te_chunked = false;
     let mut cl_value: Option<u64> = None;
 
@@ -382,12 +503,12 @@ fn parse_body_length(headers: &str) -> Result<BodyLength> {
             let len: u64 = val
                 .parse()
                 .map_err(|_| miette!("Request contains invalid Content-Length value"))?;
-            if let Some(prev) = cl_value {
-                if prev != len {
-                    return Err(miette!(
-                        "Request contains multiple Content-Length headers with differing values ({prev} vs {len})"
-                    ));
-                }
+            if let Some(prev) = cl_value
+                && prev != len
+            {
+                return Err(miette!(
+                    "Request contains multiple Content-Length headers with differing values ({prev} vs {len})"
+                ));
             }
             cl_value = Some(len);
         }
@@ -409,7 +530,12 @@ fn parse_body_length(headers: &str) -> Result<BodyLength> {
 }
 
 /// Relay exactly `len` bytes from reader to writer.
-async fn relay_fixed<R, W>(reader: &mut R, writer: &mut W, len: u64) -> Result<()>
+async fn relay_fixed<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    len: u64,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -426,6 +552,9 @@ where
                 "Connection closed with {remaining} bytes remaining"
             ));
         }
+        if let Some(guard) = generation_guard {
+            guard.ensure_current()?;
+        }
         writer.write_all(&buf[..n]).await.into_diagnostic()?;
         remaining -= n as u64;
     }
@@ -441,7 +570,12 @@ where
 /// `already_forwarded` are overflow bytes that were already written to the
 /// writer during header parsing. They are seeded into the parser buffer so
 /// termination can still be detected when boundaries span reads.
-async fn relay_chunked<R, W>(reader: &mut R, writer: &mut W, already_forwarded: &[u8]) -> Result<()>
+async fn relay_chunked<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    already_forwarded: &[u8],
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -464,6 +598,9 @@ where
             let n = reader.read(&mut read_buf).await.into_diagnostic()?;
             if n == 0 {
                 return Err(miette!("Chunked body ended before chunk-size line"));
+            }
+            if let Some(guard) = generation_guard {
+                guard.ensure_current()?;
             }
             writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
             parse_buf.extend_from_slice(&read_buf[..n]);
@@ -493,6 +630,9 @@ where
                     let n = reader.read(&mut read_buf).await.into_diagnostic()?;
                     if n == 0 {
                         return Err(miette!("Chunked body ended before trailer terminator"));
+                    }
+                    if let Some(guard) = generation_guard {
+                        guard.ensure_current()?;
                     }
                     writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
                     parse_buf.extend_from_slice(&read_buf[..n]);
@@ -527,6 +667,9 @@ where
             if n == 0 {
                 return Err(miette!("Chunked body ended mid-chunk"));
             }
+            if let Some(guard) = generation_guard {
+                guard.ensure_current()?;
+            }
             writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
             parse_buf.extend_from_slice(&read_buf[..n]);
         }
@@ -550,25 +693,6 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
         .windows(2)
         .position(|w| w == b"\r\n")
         .map(|offset| start + offset)
-}
-
-/// Read and relay a full HTTP response (headers + body) from upstream to client.
-///
-/// Returns a [`RelayOutcome`] indicating whether the connection is reusable,
-/// consumed, or has been upgraded (101 Switching Protocols).
-///
-/// Note: callers that receive `Upgraded` are responsible for switching to
-/// raw bidirectional relay and forwarding the overflow bytes.
-pub(crate) async fn relay_response_to_client<U, C>(
-    upstream: &mut U,
-    client: &mut C,
-    request_method: &str,
-) -> Result<RelayOutcome>
-where
-    U: AsyncRead + Unpin,
-    C: AsyncWrite + Unpin,
-{
-    relay_response(request_method, upstream, client).await
 }
 
 async fn relay_response<U, C>(
@@ -696,11 +820,11 @@ where
         BodyLength::ContentLength(len) => {
             let remaining = len.saturating_sub(overflow_len);
             if remaining > 0 {
-                relay_fixed(upstream, client, remaining).await?;
+                relay_fixed(upstream, client, remaining, None).await?;
             }
         }
         BodyLength::Chunked => {
-            relay_chunked(upstream, client, &buf[header_end..]).await?;
+            relay_chunked(upstream, client, &buf[header_end..], None).await?;
         }
         BodyLength::None => unreachable!(),
     }
@@ -838,10 +962,20 @@ fn is_benign_close(err: &std::io::Error) -> bool {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::iter_on_single_items,
+    clippy::manual_string_new,
+    clippy::collapsible_if,
+    clippy::cast_possible_truncation,
+    reason = "Test code: test fixtures and explicit value-shape assertions are idiomatic in tests."
+)]
 mod tests {
     use super::*;
+    use crate::opa::OpaEngine;
     use crate::secrets::SecretResolver;
     use base64::Engine as _;
+
+    const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
 
     #[test]
     fn parse_content_length() {
@@ -1044,7 +1178,11 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let result = parse_http_request(&mut client).await;
+        let result = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await;
         assert!(result.is_err(), "Must reject headers with bare LF");
     }
 
@@ -1057,7 +1195,11 @@ mod tests {
             raw.extend_from_slice(b"GET /api HTTP/1.1\r\nHost: x\r\nX-Bad: \xc0\xaf\r\n\r\n");
             writer.write_all(&raw).await.unwrap();
         });
-        let result = parse_http_request(&mut client).await;
+        let result = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await;
         assert!(result.is_err(), "Must reject headers with invalid UTF-8");
     }
 
@@ -1071,8 +1213,178 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let result = parse_http_request(&mut client).await;
+        let result = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await;
         assert!(result.is_err(), "Must reject unsupported HTTP version");
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_canonicalizes_target_and_rewrites_raw_header() {
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"GET /public/../secret HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let req = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .expect("request should parse")
+        .expect("request should exist");
+        // Path fed to OPA evaluation is canonical.
+        assert_eq!(req.target, "/secret");
+        // raw_header (forwarded byte-for-byte to upstream) is also canonical
+        // — this is the invariant the L7 canonicalization PR must uphold.
+        assert_eq!(
+            req.raw_header, b"GET /secret HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+            "outbound request line must carry the canonical path"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_canonicalization_preserves_query_string() {
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"GET /public/../v1/list?limit=10&sort=asc HTTP/1.1\r\nHost: h\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let req = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(req.target, "/v1/list");
+        assert_eq!(
+            req.raw_header, b"GET /v1/list?limit=10&sort=asc HTTP/1.1\r\nHost: h\r\n\r\n",
+            "canonical rewrite must preserve the query string verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_leaves_canonical_input_byte_for_byte() {
+        // When the input is already canonical, the raw_header must pass
+        // through unchanged — otherwise legitimate traffic pays a rewrite
+        // cost on every request.
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"GET /api/v1/users HTTP/1.1\r\nHost: api.example.com\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let req = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(req.target, "/api/v1/users");
+        assert_eq!(
+            req.raw_header,
+            b"GET /api/v1/users HTTP/1.1\r\nHost: api.example.com\r\n\r\n",
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_rejects_traversal_above_root() {
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"GET /.. HTTP/1.1\r\nHost: h\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let result = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a target that escapes the path root must be rejected at the parser"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_accepts_encoded_slash_when_endpoint_opts_in() {
+        // GitLab-style endpoints legitimately embed `%2F` in path segments
+        // (e.g. `/api/v4/projects/group%2Fproject`). Passing a provider
+        // constructed with `allow_encoded_slash: true` models the
+        // endpoint-config wiring that flows from `L7EndpointConfig`.
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"GET /api/v4/projects/group%2Fproject HTTP/1.1\r\nHost: g\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let options = crate::l7::path::CanonicalizeOptions {
+            allow_encoded_slash: true,
+            ..Default::default()
+        };
+        let req = parse_http_request(&mut client, &options)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(req.target, "/api/v4/projects/group%2Fproject");
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_rejects_encoded_slash_by_default() {
+        // Default strict options must reject `%2F` — this is the security
+        // posture for endpoints where an encoded slash would let an
+        // attacker disagree with the upstream on segment boundaries.
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"GET /api/v4/projects/group%2Fproject HTTP/1.1\r\nHost: g\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let result = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "default options must reject encoded slashes in the path"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_http_request_preserves_http_10_version_on_rewrite() {
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            writer
+                .write_all(b"GET /a/./b HTTP/1.0\r\nHost: h\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let req = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(req.target, "/a/b");
+        assert!(
+            req.raw_header.starts_with(b"GET /a/b HTTP/1.0\r\n"),
+            "rewrite must preserve the original HTTP version, got: {:?}",
+            String::from_utf8_lossy(&req.raw_header)
+        );
     }
 
     #[tokio::test]
@@ -1086,10 +1398,13 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let req = parse_http_request(&mut client)
-            .await
-            .expect("request should parse")
-            .expect("request should exist");
+        let req = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .expect("request should parse")
+        .expect("request should exist");
         assert_eq!(req.target, "/download");
         assert_eq!(
             req.query_params.get("slug").cloned(),
@@ -1119,10 +1434,13 @@ mod tests {
                 .unwrap();
         });
 
-        let first = parse_http_request(&mut client)
-            .await
-            .expect("first request should parse")
-            .expect("expected first request");
+        let first = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .expect("first request should parse")
+        .expect("expected first request");
         assert_eq!(first.action, "GET");
         assert_eq!(first.target, "/allowed");
         assert!(first.query_params.is_empty());
@@ -1131,10 +1449,13 @@ mod tests {
             "raw_header must contain only the first request's headers"
         );
 
-        let second = parse_http_request(&mut client)
-            .await
-            .expect("second request should parse")
-            .expect("expected second request");
+        let second = parse_http_request(
+            &mut client,
+            &crate::l7::path::CanonicalizeOptions::default(),
+        )
+        .await
+        .expect("second request should parse")
+        .expect("expected second request");
         assert_eq!(second.action, "POST");
         assert_eq!(second.target, "/blocked");
         assert!(second.query_params.is_empty());
@@ -1675,6 +1996,47 @@ mod tests {
         );
 
         upstream_task.await.expect("upstream task should complete");
+    }
+
+    #[tokio::test]
+    async fn relay_request_guard_blocks_stale_generation_before_upstream_write() {
+        let policy_data = "network_policies: {}\n";
+        let engine = OpaEngine::from_strings(TEST_POLICY, policy_data).unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        engine.reload(TEST_POLICY, policy_data).unwrap();
+
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/api".to_string(),
+            query_params: HashMap::new(),
+            raw_header: b"GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let result = relay_http_request_with_resolver_guarded(
+            &req,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            None,
+            Some(&guard),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "stale generation must stop relay before upstream write"
+        );
+
+        drop(proxy_to_upstream);
+        let mut forwarded = Vec::new();
+        upstream_side.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "stale request bytes must not reach upstream"
+        );
     }
 
     #[test]

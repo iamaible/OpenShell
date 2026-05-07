@@ -30,6 +30,10 @@ _BASE_PROCESS = sandbox_pb2.ProcessPolicy(run_as_user="sandbox", run_as_group="s
 # Standard proxy address inside the sandbox network namespace
 _PROXY_HOST = "10.200.0.1"
 _PROXY_PORT = 3128
+# sslip.io keeps the wildcard test on deterministic public DNS. Vendor-owned
+# telemetry subdomains can be NXDOMAIN or resolve to private ranges in CI.
+_PUBLIC_WILDCARD_SUFFIX = "1.1.1.1.sslip.io"
+_PUBLIC_WILDCARD_PATTERN = f"*.{_PUBLIC_WILDCARD_SUFFIX}"
 
 
 def _base_policy(
@@ -622,13 +626,13 @@ def test_l4_log_fields(
         assert log_result.exit_code == 0, log_result.stderr
         log = log_result.stdout
 
-        # Verify structured fields in allow line
-        assert "action=allow" in log or 'action="allow"' in log or "action=allow" in log
-        assert "dst_host=api.anthropic.com" in log or "dst_host" in log
-        assert "engine=opa" in log or 'engine="opa"' in log
+        # Verify OCSF shorthand fields in allow line
+        assert "ALLOWED" in log, "Expected ALLOWED in OCSF shorthand"
+        assert "api.anthropic.com" in log, "Expected destination host in log"
+        assert "engine:opa" in log, "Expected engine:opa in log context"
 
         # Verify deny line exists
-        assert "action=deny" in log or 'action="deny"' in log
+        assert "DENIED" in log, "Expected DENIED in OCSF shorthand"
 
 
 # =============================================================================
@@ -694,8 +698,10 @@ def test_ssrf_log_shows_blocked_address(
 ) -> None:
     """SSRF-3: Proxy log includes block reason when SSRF check fires.
 
-    Loopback addresses are always-blocked even with implicit allowed_ips.
-    The log should show 'always-blocked' for 127.0.0.1.
+    Loopback addresses are always-blocked.  Since implicit_allowed_ips_for_ip_host
+    now skips always-blocked hosts, 127.0.0.1 falls through to the default
+    resolve_and_reject_internal path which blocks it as an internal address.
+    The shorthand log should include 'ssrf' and a '[reason:' tag for denied events.
     """
     policy = _base_policy(
         network_policies={
@@ -715,8 +721,13 @@ def test_ssrf_log_shows_blocked_address(
         log_result = sb.exec_python(_read_openshell_log())
         assert log_result.exit_code == 0, log_result.stderr
         log = log_result.stdout
-        assert "always-blocked" in log.lower(), (
-            f"Expected 'always-blocked' in proxy log, got:\n{log}"
+        # OCSF shorthand uses "engine:ssrf" for SSRF blocks
+        assert "engine:ssrf" in log.lower() or "ssrf" in log.lower(), (
+            f"Expected SSRF block indicator in proxy log, got:\n{log}"
+        )
+        # Shorthand for denied events should include [reason:...] tag
+        assert "[reason:" in log.lower(), (
+            f"Expected [reason:] tag in denied event shorthand, got:\n{log}"
         )
 
 
@@ -838,7 +849,13 @@ def test_ssrf_private_ip_allowed_with_literal_ip_host(
 def test_ssrf_loopback_blocked_even_with_allowed_ips(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """SSRF-7: Loopback always blocked even when allowed_ips covers 127.0.0.0/8."""
+    """SSRF-7: Loopback always blocked even when allowed_ips covers 127.0.0.0/8.
+
+    With always-blocked validation, parse_allowed_ips rejects 127.0.0.0/8 at
+    connection time (returns Err), so the proxy treats this as "invalid
+    allowed_ips in policy" and returns 403.  The end result is the same:
+    loopback is never reachable.
+    """
     policy = _base_policy(
         network_policies={
             "internal": sandbox_pb2.NetworkPolicyRule(
@@ -1001,7 +1018,9 @@ def test_l7_tls_audit_mode_allows_but_logs(
         log_result = sb.exec_python(_read_openshell_log())
         assert log_result.exit_code == 0, log_result.stderr
         log = log_result.stdout
-        assert "l7_decision=audit" in log or 'l7_decision="audit"' in log
+        # OCSF shorthand: audit decisions show as ALLOWED (audit mode allows through)
+        assert "HTTP:" in log, "Expected OCSF HTTP activity event in log"
+        assert "ALLOWED" in log, "Expected ALLOWED for audit-mode decision"
 
 
 def test_l7_tls_explicit_path_rules(
@@ -1179,11 +1198,10 @@ def test_l7_tls_log_fields(
         assert log_result.exit_code == 0, log_result.stderr
         log = log_result.stdout
 
-        assert "L7_REQUEST" in log
-        assert "l7_protocol" in log
-        assert "l7_action" in log
-        assert "l7_target" in log
-        assert "l7_decision" in log
+        # OCSF shorthand: L7 requests show as HTTP:method events
+        assert "HTTP:" in log, "Expected OCSF HTTP activity event in log"
+        assert "ALLOWED" in log or "DENIED" in log, "Expected L7 decision in log"
+        assert "policy:" in log, "Expected policy context in log"
 
 
 def test_l7_query_matchers_enforced(
@@ -1581,13 +1599,10 @@ def test_forward_proxy_log_fields(
         assert result.exit_code == 0, result.stderr
         log = result.stdout
 
-        assert "FORWARD" in log, "Expected FORWARD log lines"
-        # tracing key-value pairs quote string values: action="allow"
-        assert 'action="allow"' in log, "Expected allowed FORWARD in logs"
-        assert f"dst_host={_SANDBOX_IP}" in log, "Expected dst_host in FORWARD log"
-        assert f"dst_port={_FORWARD_PROXY_PORT}" in log, (
-            "Expected dst_port in FORWARD log"
-        )
+        # OCSF shorthand: FORWARD requests show as HTTP:method events
+        assert "HTTP:" in log, "Expected OCSF HTTP activity event for FORWARD request"
+        assert "ALLOWED" in log, "Expected ALLOWED for forward proxy allow"
+        assert f"{_SANDBOX_IP}" in log, "Expected destination IP in FORWARD log"
 
 
 # =============================================================================
@@ -1824,22 +1839,25 @@ def test_single_port_backwards_compat(
 # Host wildcard tests
 # =============================================================================
 #
-# HW-1: Wildcard *.anthropic.com matches subdomains
-# HW-2: Wildcard *.anthropic.com does NOT match anthropic.com (bare domain)
-# HW-3: Wildcard *.anthropic.com does NOT match deep.sub.anthropic.com
+# HW-1: Wildcard host pattern matches subdomains
+# HW-2: Wildcard host pattern does NOT match the bare domain
+# HW-3: Wildcard host pattern does NOT match deep subdomains
 # =============================================================================
 
 
 def test_host_wildcard_matches_subdomain(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """HW-1: *.anthropic.com matches api.anthropic.com."""
+    """HW-1: host wildcard matches single-label subdomains."""
     policy = _base_policy(
         network_policies={
             "wildcard": sandbox_pb2.NetworkPolicyRule(
                 name="wildcard",
                 endpoints=[
-                    sandbox_pb2.NetworkEndpoint(host="*.anthropic.com", port=443),
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_PUBLIC_WILDCARD_PATTERN,
+                        port=443,
+                    ),
                 ],
                 binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
@@ -1847,38 +1865,44 @@ def test_host_wildcard_matches_subdomain(
     )
     spec = datamodel_pb2.SandboxSpec(policy=policy)
     with sandbox(spec=spec, delete_on_exit=True) as sb:
-        # api.anthropic.com -> matches *.anthropic.com
-        result = sb.exec_python(_proxy_connect(), args=("api.anthropic.com", 443))
+        first_subdomain = f"alpha.{_PUBLIC_WILDCARD_SUFFIX}"
+        result = sb.exec_python(_proxy_connect(), args=(first_subdomain, 443))
         assert result.exit_code == 0, result.stderr
         assert "200" in result.stdout, (
-            f"*.anthropic.com should match api.anthropic.com: {result.stdout}"
+            f"{_PUBLIC_WILDCARD_PATTERN} should match {first_subdomain}: "
+            f"{result.stdout}"
         )
 
-        # statsig.anthropic.com -> also matches *.anthropic.com
-        result = sb.exec_python(_proxy_connect(), args=("statsig.anthropic.com", 443))
+        second_subdomain = f"beta.{_PUBLIC_WILDCARD_SUFFIX}"
+        result = sb.exec_python(_proxy_connect(), args=(second_subdomain, 443))
         assert result.exit_code == 0, result.stderr
         assert "200" in result.stdout, (
-            f"*.anthropic.com should match statsig.anthropic.com: {result.stdout}"
+            f"{_PUBLIC_WILDCARD_PATTERN} should match {second_subdomain}: "
+            f"{result.stdout}"
         )
 
-        # example.com -> does NOT match *.anthropic.com
+        # example.com -> does NOT match the wildcard pattern
         result = sb.exec_python(_proxy_connect(), args=("example.com", 443))
         assert result.exit_code == 0, result.stderr
         assert "403" in result.stdout, (
-            f"*.anthropic.com should NOT match example.com: {result.stdout}"
+            f"{_PUBLIC_WILDCARD_PATTERN} should NOT match example.com: "
+            f"{result.stdout}"
         )
 
 
 def test_host_wildcard_rejects_bare_domain(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """HW-2: *.anthropic.com does NOT match anthropic.com (requires a subdomain)."""
+    """HW-2: host wildcard does NOT match the bare domain."""
     policy = _base_policy(
         network_policies={
             "wildcard": sandbox_pb2.NetworkPolicyRule(
                 name="wildcard",
                 endpoints=[
-                    sandbox_pb2.NetworkEndpoint(host="*.anthropic.com", port=443),
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_PUBLIC_WILDCARD_PATTERN,
+                        port=443,
+                    ),
                 ],
                 binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
@@ -1886,17 +1910,18 @@ def test_host_wildcard_rejects_bare_domain(
     )
     spec = datamodel_pb2.SandboxSpec(policy=policy)
     with sandbox(spec=spec, delete_on_exit=True) as sb:
-        result = sb.exec_python(_proxy_connect(), args=("anthropic.com", 443))
+        result = sb.exec_python(_proxy_connect(), args=(_PUBLIC_WILDCARD_SUFFIX, 443))
         assert result.exit_code == 0, result.stderr
         assert "403" in result.stdout, (
-            f"*.anthropic.com should NOT match bare anthropic.com: {result.stdout}"
+            f"{_PUBLIC_WILDCARD_PATTERN} should NOT match bare "
+            f"{_PUBLIC_WILDCARD_SUFFIX}: {result.stdout}"
         )
 
 
 def test_host_wildcard_rejects_deep_subdomain(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """HW-3: *.anthropic.com does NOT match deep.sub.anthropic.com.
+    """HW-3: host wildcard does NOT match a deep subdomain.
 
     Single * matches one DNS label only (does not cross . boundaries).
     """
@@ -1905,7 +1930,10 @@ def test_host_wildcard_rejects_deep_subdomain(
             "wildcard": sandbox_pb2.NetworkPolicyRule(
                 name="wildcard",
                 endpoints=[
-                    sandbox_pb2.NetworkEndpoint(host="*.anthropic.com", port=443),
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_PUBLIC_WILDCARD_PATTERN,
+                        port=443,
+                    ),
                 ],
                 binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
@@ -1913,10 +1941,12 @@ def test_host_wildcard_rejects_deep_subdomain(
     )
     spec = datamodel_pb2.SandboxSpec(policy=policy)
     with sandbox(spec=spec, delete_on_exit=True) as sb:
-        result = sb.exec_python(_proxy_connect(), args=("deep.sub.anthropic.com", 443))
+        deep_subdomain = f"deep.sub.{_PUBLIC_WILDCARD_SUFFIX}"
+        result = sb.exec_python(_proxy_connect(), args=(deep_subdomain, 443))
         assert result.exit_code == 0, result.stderr
         assert "403" in result.stdout, (
-            f"*.anthropic.com should NOT match deep.sub.anthropic.com: {result.stdout}"
+            f"{_PUBLIC_WILDCARD_PATTERN} should NOT match {deep_subdomain}: "
+            f"{result.stdout}"
         )
 
 
