@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 import grpc
 
 from ._proto import (
+    datamodel_pb2,
     inference_pb2,
     inference_pb2_grpc,
     openshell_pb2,
@@ -293,13 +294,13 @@ class SandboxClient:
         )
         sb = response.sandbox
         return SandboxFull(
-            id=sb.id,
-            name=sb.name,
-            namespace=sb.namespace,
+            id=sb.metadata.id if sb.metadata else "",
+            name=sb.metadata.name if sb.metadata else "",
+            namespace="",  # removed from proto; retained in SandboxFull for compat
             phase=sb.phase,
             spec=sb.spec,
             status=sb.status,
-            created_at_ms=sb.created_at_ms,
+            created_at_ms=sb.metadata.created_at_ms if sb.metadata else 0,
             current_policy_version=sb.current_policy_version,
         )
 
@@ -316,7 +317,7 @@ class SandboxClient:
         config: dict[str, str] | None = None,
     ) -> ProviderRef:
         provider = datamodel_pb2.Provider(
-            name=name,
+            metadata=datamodel_pb2.ObjectMeta(name=name),
             type=provider_type,
             credentials=credentials or {},
             config=config or {},
@@ -352,7 +353,7 @@ class SandboxClient:
         config: dict[str, str] | None = None,
     ) -> ProviderRef:
         provider = datamodel_pb2.Provider(
-            name=name,
+            metadata=datamodel_pb2.ObjectMeta(name=name),
             type=provider_type,
             credentials=credentials or {},
             config=config or {},
@@ -828,8 +829,8 @@ def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
 
 def _provider_ref(provider: openshell_pb2.Provider) -> ProviderRef:
     return ProviderRef(
-        id=provider.id,
-        name=provider.name,
+        id=provider.metadata.id if provider.metadata else "",
+        name=provider.metadata.name if provider.metadata else "",
         type=provider.type,
         config=dict(provider.config),
     )
