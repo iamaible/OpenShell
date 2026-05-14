@@ -6,9 +6,9 @@
 replicaCount: 1
 
 image:
-  repository: ghcr.io/nvidia/openshell/gateway
+  repository: docker.io/aible/openshell-gateway
   pullPolicy: IfNotPresent
-  tag: ""
+  tag: "20260512"
 
 # Supervisor image — provides the openshell-sandbox binary that is copied into
 # sandbox pods via an init container. tag defaults to appVersion (same as the
