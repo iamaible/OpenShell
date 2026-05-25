@@ -28,6 +28,7 @@ TARGET="${1:-all}"
 IMAGE_TAG="${IMAGE_TAG:-dev}"
 GATEWAY_IMAGE="${GATEWAY_IMAGE:-docker.io/aible/openshell-gateway}"
 SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE:-docker.io/aible/openshell-supervisor}"
+GATEWAY_BASE_IMAGE="${GATEWAY_BASE_IMAGE:-ghcr.io/nvidia/openshell/gateway:latest}"
 # Supervisor base: debian-slim provides glibc + ld-linux for our dynamically
 # linked openshell-sandbox binary. The upstream image is FROM scratch (their
 # binary is statically linked), so we can't use it as a base for ours. We use
@@ -37,7 +38,6 @@ SUPERVISOR_BASE_IMAGE="${SUPERVISOR_BASE_IMAGE:-debian:trixie-slim}"
 
 build_gateway() {
     echo "=== Building gateway: ${GATEWAY_IMAGE}:${IMAGE_TAG} ==="
-    GATEWAY_BASE_IMAGE="${GATEWAY_BASE_IMAGE:-ghcr.io/nvidia/openshell/gateway:latest}"
     ce_build \
         -f "${ROOT}/deploy/docker/Dockerfile.gateway" \
         --build-arg BASE_IMAGE="${GATEWAY_BASE_IMAGE}" \
