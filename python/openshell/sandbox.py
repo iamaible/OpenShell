@@ -508,11 +508,11 @@ class SandboxClient:
             id=sb.metadata.id if sb.metadata else "",
             name=sb.metadata.name if sb.metadata else "",
             namespace="",  # removed from proto; retained in SandboxFull for compat
-            phase=sb.phase,
+            phase=sb.status.phase if sb.status else 0,
             spec=sb.spec,
             status=sb.status,
             created_at_ms=sb.metadata.created_at_ms if sb.metadata else 0,
-            current_policy_version=sb.current_policy_version,
+            current_policy_version=sb.status.current_policy_version if sb.status else 0,
         )
 
     # ------------------------------------------------------------------
