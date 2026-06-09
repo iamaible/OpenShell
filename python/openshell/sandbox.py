@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 
 import grpc
 import httpx
+from google.protobuf import json_format
 
 from ._proto import (
     datamodel_pb2,
@@ -578,6 +579,63 @@ class SandboxClient:
     def delete_provider(self, name: str) -> bool:
         response = self._stub.DeleteProvider(
             openshell_pb2.DeleteProviderRequest(name=name),
+            timeout=self._timeout,
+        )
+        return bool(response.deleted)
+
+    # ------------------------------------------------------------------
+    # Provider profiles
+    # ------------------------------------------------------------------
+
+    def list_provider_profiles(
+        self, *, limit: int = 100, offset: int = 0
+    ) -> builtins.list[object]:
+        response = self._stub.ListProviderProfiles(
+            openshell_pb2.ListProviderProfilesRequest(limit=limit, offset=offset),
+            timeout=self._timeout,
+        )
+        return list(response.profiles)
+
+    def get_provider_profile(self, profile_id: str) -> object:
+        response = self._stub.GetProviderProfile(
+            openshell_pb2.GetProviderProfileRequest(id=profile_id),
+            timeout=self._timeout,
+        )
+        return response.profile
+
+    def import_provider_profiles(
+        self, profiles: builtins.list[dict]
+    ) -> openshell_pb2.ImportProviderProfilesResponse:
+        items = [
+            openshell_pb2.ProviderProfileImportItem(
+                profile=json_format.ParseDict(p, openshell_pb2.ProviderProfile()),
+                source=p.get("source", ""),
+            )
+            for p in profiles
+        ]
+        return self._stub.ImportProviderProfiles(
+            openshell_pb2.ImportProviderProfilesRequest(profiles=items),
+            timeout=self._timeout,
+        )
+
+    def lint_provider_profiles(
+        self, profiles: builtins.list[dict]
+    ) -> openshell_pb2.LintProviderProfilesResponse:
+        items = [
+            openshell_pb2.ProviderProfileImportItem(
+                profile=json_format.ParseDict(p, openshell_pb2.ProviderProfile()),
+                source=p.get("source", ""),
+            )
+            for p in profiles
+        ]
+        return self._stub.LintProviderProfiles(
+            openshell_pb2.LintProviderProfilesRequest(profiles=items),
+            timeout=self._timeout,
+        )
+
+    def delete_provider_profile(self, profile_id: str) -> bool:
+        response = self._stub.DeleteProviderProfile(
+            openshell_pb2.DeleteProviderProfileRequest(id=profile_id),
             timeout=self._timeout,
         )
         return bool(response.deleted)
