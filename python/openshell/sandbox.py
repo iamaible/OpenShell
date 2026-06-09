@@ -641,6 +641,87 @@ class SandboxClient:
         return bool(response.deleted)
 
     # ------------------------------------------------------------------
+    # Provider credential refresh
+    # ------------------------------------------------------------------
+
+    def configure_provider_refresh(
+        self,
+        provider_name: str,
+        credential_key: str,
+        strategy: str = "",
+        *,
+        material: "dict[str, str] | None" = None,
+        secret_material_keys: "list[str] | None" = None,
+        expires_at_ms: "int | None" = None,
+    ) -> object:
+        """Configure gateway-owned refresh material for one provider credential."""
+        _strategy_map = {
+            "": 0,
+            "static": 1,
+            "external": 2,
+            "oauth2_refresh_token": 3,
+            "oauth2-refresh-token": 3,
+            "oauth2_client_credentials": 4,
+            "oauth2-client-credentials": 4,
+            "google_service_account_jwt": 5,
+            "google-service-account-jwt": 5,
+        }
+        req = openshell_pb2.ConfigureProviderRefreshRequest(
+            provider=provider_name,
+            credential_key=credential_key,
+            strategy=_strategy_map.get(strategy, 0),
+            material=material or {},
+            secret_material_keys=secret_material_keys or [],
+        )
+        if expires_at_ms is not None:
+            req.expires_at_ms = expires_at_ms
+        return self._stub.ConfigureProviderRefresh(req, timeout=self._timeout)
+
+    def get_provider_refresh_status(
+        self,
+        provider_name: str,
+        credential_key: str = "",
+    ) -> "list[object]":
+        """Get credential refresh status for a provider."""
+        response = self._stub.GetProviderRefreshStatus(
+            openshell_pb2.GetProviderRefreshStatusRequest(
+                provider=provider_name,
+                credential_key=credential_key,
+            ),
+            timeout=self._timeout,
+        )
+        return list(response.credentials)
+
+    def rotate_provider_credential(
+        self,
+        provider_name: str,
+        credential_key: str,
+    ) -> object:
+        """Force an immediate credential rotation for a provider."""
+        return self._stub.RotateProviderCredential(
+            openshell_pb2.RotateProviderCredentialRequest(
+                provider=provider_name,
+                credential_key=credential_key,
+            ),
+            timeout=self._timeout,
+        )
+
+    def delete_provider_refresh(
+        self,
+        provider_name: str,
+        credential_key: str,
+    ) -> bool:
+        """Remove a credential refresh configuration."""
+        response = self._stub.DeleteProviderRefresh(
+            openshell_pb2.DeleteProviderRefreshRequest(
+                provider=provider_name,
+                credential_key=credential_key,
+            ),
+            timeout=self._timeout,
+        )
+        return bool(response.deleted)
+
+    # ------------------------------------------------------------------
     # Draft policy recommendations
     # ------------------------------------------------------------------
 
