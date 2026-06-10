@@ -165,6 +165,11 @@ class ProviderRef:
     name: str
     type: str
     config: dict[str, str]
+    # Names of stored credentials on the gateway. Values are intentionally
+    # not exposed — the gateway redacts them on the wire. Callers needing
+    # to verify a provider holds a specific credential (e.g. SLACK_BOT_TOKEN)
+    # check membership in credential_keys.
+    credential_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1205,6 +1210,7 @@ def _provider_ref(provider: openshell_pb2.Provider) -> ProviderRef:
         name=provider.metadata.name if provider.metadata else "",
         type=provider.type,
         config=dict(provider.config),
+        credential_keys=tuple(sorted(provider.credentials.keys())),
     )
 
 
