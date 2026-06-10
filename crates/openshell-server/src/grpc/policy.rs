@@ -3690,6 +3690,95 @@ pub(super) async fn save_sandbox_settings(
     save_settings_record(store, SANDBOX_SETTINGS_OBJECT_TYPE, sandbox_name, settings).await
 }
 
+/// Seed global gateway settings from `OPENSHELL_SETTING_*` environment variables.
+///
+/// The suffix after `OPENSHELL_SETTING_` is lowercased to form the setting key,
+/// e.g. `OPENSHELL_SETTING_PROVIDERS_V2_ENABLED=true` seeds `providers_v2_enabled`.
+///
+/// Only absent keys are written — values already present in the database are left
+/// untouched, so operator changes made at runtime survive gateway restarts.
+pub(crate) async fn seed_global_settings_from_env(store: &Store) -> Result<(), Status> {
+    const PREFIX: &str = "OPENSHELL_SETTING_";
+    let pairs: Vec<(String, String)> = std::env::vars()
+        .filter_map(|(k, v)| {
+            k.strip_prefix(PREFIX)
+                .map(|suffix| (suffix.to_ascii_lowercase(), v))
+        })
+        .collect();
+    seed_global_settings_from_pairs(store, pairs).await
+}
+
+async fn seed_global_settings_from_pairs(
+    store: &Store,
+    seed_pairs: Vec<(String, String)>,
+) -> Result<(), Status> {
+    if seed_pairs.is_empty() {
+        return Ok(());
+    }
+
+    let mut stored = load_global_settings(store).await?;
+    let mut changed = false;
+
+    for (key, raw) in &seed_pairs {
+        if stored.settings.contains_key(key.as_str()) {
+            continue;
+        }
+
+        let Some(registered) = settings::setting_for_key(key) else {
+            warn!(key = key.as_str(), "OPENSHELL_SETTING env var specifies unknown settings key, skipping");
+            continue;
+        };
+
+        let value = match registered.kind {
+            SettingValueKind::Bool => match settings::parse_bool_like(raw) {
+                Some(b) => StoredSettingValue::Bool(b),
+                None => {
+                    warn!(
+                        key = key.as_str(),
+                        raw = raw.as_str(),
+                        "OPENSHELL_SETTING env var has invalid bool value, skipping"
+                    );
+                    continue;
+                }
+            },
+            SettingValueKind::Int => match raw.trim().parse::<i64>() {
+                Ok(n) => StoredSettingValue::Int(n),
+                Err(_) => {
+                    warn!(
+                        key = key.as_str(),
+                        raw = raw.as_str(),
+                        "OPENSHELL_SETTING env var has invalid int value, skipping"
+                    );
+                    continue;
+                }
+            },
+            SettingValueKind::String => {
+                if let Err(allowed) = registered.validate_string_value(raw) {
+                    warn!(
+                        key = key.as_str(),
+                        raw = raw.as_str(),
+                        allowed = allowed.join(", "),
+                        "OPENSHELL_SETTING env var value not in allowed list, skipping"
+                    );
+                    continue;
+                }
+                StoredSettingValue::String(raw.clone())
+            }
+        };
+
+        stored.settings.insert(key.clone(), value);
+        info!(key = key.as_str(), "seeded global setting from environment");
+        changed = true;
+    }
+
+    if changed {
+        stored.revision = stored.revision.wrapping_add(1);
+        save_global_settings(store, &stored).await?;
+    }
+
+    Ok(())
+}
+
 async fn load_settings_record(
     store: &Store,
     object_type: &str,
@@ -9523,6 +9612,116 @@ mod tests {
         assert!(
             final_sandbox.spec.as_ref().unwrap().policy.is_some(),
             "policy should be backfilled after one success"
+        );
+    }
+
+    // ---- seed_global_settings_from_pairs (backing seed_global_settings_from_env) ----
+
+    fn pairs(kvs: &[(&str, &str)]) -> Vec<(String, String)> {
+        kvs.iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn seed_writes_absent_bool_setting() {
+        let store = crate::persistence::test_store().await;
+        seed_global_settings_from_pairs(&store, pairs(&[("providers_v2_enabled", "true")]))
+            .await
+            .unwrap();
+
+        let stored = load_global_settings(&store).await.unwrap();
+        assert_eq!(
+            stored.settings.get("providers_v2_enabled"),
+            Some(&StoredSettingValue::Bool(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_does_not_overwrite_existing_value() {
+        let store = crate::persistence::test_store().await;
+
+        let mut existing = StoredSettings::default();
+        existing
+            .settings
+            .insert("providers_v2_enabled".to_string(), StoredSettingValue::Bool(false));
+        existing.revision = 1;
+        save_global_settings(&store, &existing).await.unwrap();
+
+        seed_global_settings_from_pairs(&store, pairs(&[("providers_v2_enabled", "true")]))
+            .await
+            .unwrap();
+
+        let stored = load_global_settings(&store).await.unwrap();
+        assert_eq!(
+            stored.settings.get("providers_v2_enabled"),
+            Some(&StoredSettingValue::Bool(false)),
+            "existing DB value must not be overwritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_skips_unknown_key() {
+        let store = crate::persistence::test_store().await;
+        seed_global_settings_from_pairs(&store, pairs(&[("unknown_key_xyz", "true")]))
+            .await
+            .unwrap();
+
+        let stored = load_global_settings(&store).await.unwrap();
+        assert!(stored.settings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn seed_skips_invalid_bool_value() {
+        let store = crate::persistence::test_store().await;
+        seed_global_settings_from_pairs(&store, pairs(&[("providers_v2_enabled", "notabool")]))
+            .await
+            .unwrap();
+
+        let stored = load_global_settings(&store).await.unwrap();
+        assert!(
+            stored.settings.get("providers_v2_enabled").is_none(),
+            "invalid bool value must not be stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_noop_when_pairs_empty() {
+        let store = crate::persistence::test_store().await;
+        seed_global_settings_from_pairs(&store, vec![]).await.unwrap();
+
+        let stored = load_global_settings(&store).await.unwrap();
+        assert!(stored.settings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn seed_skips_invalid_string_value_for_constrained_key() {
+        let store = crate::persistence::test_store().await;
+        seed_global_settings_from_pairs(
+            &store,
+            pairs(&[("proposal_approval_mode", "not_a_valid_mode")]),
+        )
+        .await
+        .unwrap();
+
+        let stored = load_global_settings(&store).await.unwrap();
+        assert!(
+            stored.settings.get("proposal_approval_mode").is_none(),
+            "invalid string value must not be stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_writes_valid_string_value() {
+        let store = crate::persistence::test_store().await;
+        seed_global_settings_from_pairs(&store, pairs(&[("proposal_approval_mode", "auto")]))
+            .await
+            .unwrap();
+
+        let stored = load_global_settings(&store).await.unwrap();
+        assert_eq!(
+            stored.settings.get("proposal_approval_mode"),
+            Some(&StoredSettingValue::String("auto".to_string()))
         );
     }
 }

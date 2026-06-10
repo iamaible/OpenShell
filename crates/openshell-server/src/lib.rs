@@ -205,6 +205,10 @@ pub async fn run_server(
 
     let store = Arc::new(Store::connect(database_url).await?);
 
+    if let Err(e) = grpc::policy::seed_global_settings_from_env(&store).await {
+        warn!("failed to seed settings from environment: {}", e.message());
+    }
+
     let oidc_cache = if let Some(ref oidc) = config.oidc {
         // Validate RBAC configuration before starting.
         let policy = auth::authz::AuthzPolicy {
