@@ -1179,12 +1179,20 @@ fn sandbox_template_to_k8s(
             serde_json::Value::String(params.sandbox_id.to_string()),
         );
     }
-    if !pod_annotations.is_empty() {
-        metadata.insert(
-            "annotations".to_string(),
-            serde_json::Value::Object(pod_annotations),
-        );
-    }
+    // Sandbox pods must not be Istio mesh members. The sandbox network architecture
+    // runs OpenClaw in a separate network namespace connected via a veth pair to the
+    // main pod netns. Istio's PREROUTING rules fire on veth-ingress traffic and
+    // redirect it to Envoy:15006 before it reaches the openshell-sandb proxy on
+    // 10.200.0.1:3128, breaking all OpenClaw egress. NetworkPolicy in the openshell
+    // chart is what gates sandbox traffic.
+    pod_annotations.insert(
+        "sidecar.istio.io/inject".to_string(),
+        serde_json::Value::String("false".to_string()),
+    );
+    metadata.insert(
+        "annotations".to_string(),
+        serde_json::Value::Object(pod_annotations),
+    );
 
     let mut spec = serde_json::Map::new();
     let runtime_class_name = platform_config_string(template, "runtime_class_name").or_else(|| {
@@ -2946,5 +2954,77 @@ mod tests {
         let vct = default_workspace_volume_claim_templates("");
         let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
         assert_eq!(storage, DEFAULT_WORKSPACE_STORAGE_SIZE);
+    }
+
+    #[test]
+    fn sandbox_pod_always_disables_istio_sidecar_injection() {
+        // Istio's PREROUTING rules intercept veth-ingress traffic from the
+        // sandbox netns and redirect it to Envoy:15006, preventing OpenClaw
+        // from reaching the openshell-sandb proxy on 10.200.0.1:3128.
+        let pod_template = {
+            let params = SandboxPodParams {
+                sandbox_id: "test-id",
+                ..Default::default()
+            };
+            sandbox_template_to_k8s(
+                &SandboxTemplate::default(),
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        assert_eq!(
+            pod_template["metadata"]["annotations"]["sidecar.istio.io/inject"],
+            serde_json::json!("false"),
+            "sandbox pods must opt out of Istio sidecar injection"
+        );
+    }
+
+    #[test]
+    fn sandbox_pod_disables_istio_injection_even_with_custom_annotations() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "annotations".to_string(),
+                    Value {
+                        kind: Some(Kind::StructValue(Struct {
+                            fields: std::iter::once((
+                                "custom.io/tag".to_string(),
+                                Value {
+                                    kind: Some(Kind::StringValue("value".to_string())),
+                                },
+                            ))
+                            .collect(),
+                        })),
+                    },
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        assert_eq!(
+            pod_template["metadata"]["annotations"]["sidecar.istio.io/inject"],
+            serde_json::json!("false"),
+            "Istio inject annotation must be false even when custom annotations are present"
+        );
+        assert_eq!(
+            pod_template["metadata"]["annotations"]["custom.io/tag"],
+            serde_json::json!("value"),
+            "custom annotations should be preserved alongside the Istio disable"
+        );
     }
 }
