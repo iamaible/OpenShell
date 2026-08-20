@@ -7,7 +7,7 @@ use crate::builders::SandboxContext;
 use crate::enums::{ActionId, ActivityId, DispositionId, SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{HttpActivityEvent, OcsfEvent};
-use crate::objects::{Actor, Endpoint, FirewallRule, HttpRequest, HttpResponse, Process};
+use crate::objects::{Actor, Endpoint, FirewallRule, HttpRequest, HttpResponse};
 
 /// Builder for HTTP Activity [4002] events.
 pub struct HttpActivityBuilder<'a> {
@@ -25,6 +25,7 @@ pub struct HttpActivityBuilder<'a> {
     firewall_rule: Option<FirewallRule>,
     message: Option<String>,
     status_detail: Option<String>,
+    unmapped: serde_json::Map<String, serde_json::Value>,
 }
 
 impl<'a> HttpActivityBuilder<'a> {
@@ -45,24 +46,10 @@ impl<'a> HttpActivityBuilder<'a> {
             firewall_rule: None,
             message: None,
             status_detail: None,
+            unmapped: serde_json::Map::new(),
         }
     }
 
-    #[must_use]
-    pub fn activity(mut self, id: ActivityId) -> Self {
-        self.activity = id;
-        self
-    }
-    #[must_use]
-    pub fn action(mut self, id: ActionId) -> Self {
-        self.action = Some(id);
-        self
-    }
-    #[must_use]
-    pub fn disposition(mut self, id: DispositionId) -> Self {
-        self.disposition = Some(id);
-        self
-    }
     #[must_use]
     pub fn http_request(mut self, req: HttpRequest) -> Self {
         self.http_request = Some(req);
@@ -79,23 +66,15 @@ impl<'a> HttpActivityBuilder<'a> {
         self
     }
     #[must_use]
-    pub fn dst_endpoint(mut self, ep: Endpoint) -> Self {
-        self.dst_endpoint = Some(ep);
-        self
-    }
-    #[must_use]
-    pub fn actor_process(mut self, process: Process) -> Self {
-        self.actor = Some(Actor { process });
-        self
-    }
-    #[must_use]
-    pub fn firewall_rule(mut self, name: &str, rule_type: &str) -> Self {
-        self.firewall_rule = Some(FirewallRule::new(name, rule_type));
-        self
-    }
-    #[must_use]
     pub fn status_detail(mut self, detail: impl Into<String>) -> Self {
         self.status_detail = Some(detail.into());
+        self
+    }
+
+    /// Add a source-specific attribute that is not defined by the OCSF class.
+    #[must_use]
+    pub fn unmapped(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
+        self.unmapped.insert(key.to_string(), value.into());
         self
     }
 
@@ -115,6 +94,9 @@ impl<'a> HttpActivityBuilder<'a> {
         );
         if let Some(detail) = self.status_detail {
             base.set_status_detail(detail);
+        }
+        if !self.unmapped.is_empty() {
+            base.unmapped = Some(serde_json::Value::Object(self.unmapped));
         }
         self.ctx
             .apply_common_fields(&mut base, self.status, self.message);
@@ -136,13 +118,18 @@ impl<'a> HttpActivityBuilder<'a> {
     }
 }
 
+impl_activity_setter!(HttpActivityBuilder);
+impl_action_disposition_setters!(HttpActivityBuilder);
+impl_actor_process_setter!(HttpActivityBuilder);
+impl_dst_endpoint_setter!(HttpActivityBuilder);
+impl_firewall_rule_setter!(HttpActivityBuilder);
 impl_builder_setters!(HttpActivityBuilder);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::builders::test_sandbox_context;
-    use crate::objects::Url;
+    use crate::objects::{Process, Url};
 
     #[test]
     fn test_http_activity_builder() {
@@ -182,11 +169,15 @@ mod tests {
             .firewall_rule("aws_iam", "ssrf")
             .message("FORWARD blocked: allowed_ips check failed")
             .status_detail("resolves to always-blocked address")
+            .unmapped("attempt", 2)
+            .unmapped("cached", true)
             .build();
 
         let json = event.to_json().unwrap();
         assert_eq!(json["class_uid"], 4002);
         assert_eq!(json["status_detail"], "resolves to always-blocked address");
+        assert_eq!(json["unmapped"]["attempt"], 2);
+        assert_eq!(json["unmapped"]["cached"], true);
         assert_eq!(json["action_id"], 2); // Denied
     }
 }

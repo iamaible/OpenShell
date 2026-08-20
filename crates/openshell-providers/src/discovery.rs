@@ -83,6 +83,8 @@ mod tests {
     fn profile() -> ProviderTypeProfile {
         ProviderTypeProfile {
             id: "custom".to_string(),
+            resource_version: 0,
+            annotations: std::collections::HashMap::new(),
             display_name: "Custom".to_string(),
             description: String::new(),
             category: openshell_core::proto::ProviderProfileCategory::Other,
@@ -96,6 +98,8 @@ mod tests {
                     header_name: String::new(),
                     query_param: String::new(),
                     refresh: None,
+                    path_template: String::new(),
+                    token_grant: None,
                 },
                 CredentialProfile {
                     name: "secondary".to_string(),
@@ -106,6 +110,8 @@ mod tests {
                     header_name: String::new(),
                     query_param: String::new(),
                     refresh: None,
+                    path_template: String::new(),
+                    token_grant: None,
                 },
             ],
             endpoints: Vec::new(),
@@ -114,6 +120,8 @@ mod tests {
             discovery: DiscoveryProfile {
                 credentials: vec!["api_key".to_string(), "secondary".to_string()],
             },
+            source: String::new(),
+            scope: String::new(),
         }
     }
 

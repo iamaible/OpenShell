@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import errno
 import json
 import os
 import pathlib
@@ -13,13 +14,12 @@ import tempfile
 import threading
 import time
 from collections import namedtuple
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Never, SupportsIndex, cast
 from urllib.parse import urlparse
 
 import grpc
 import httpx
-from google.protobuf import json_format
 
 from ._proto import (
     datamodel_pb2,
@@ -132,11 +132,43 @@ class SandboxStatusRef:
     current_policy_version: int
 
 
+class _ImmutableLabels(dict[str, str]):
+    """A read-only, copy- and pickle-safe label mapping."""
+
+    def _deny_mutation(self, *args: object, **kwargs: object) -> Never:
+        del args, kwargs
+        raise TypeError("sandbox labels are immutable")
+
+    __setitem__ = _deny_mutation
+    __delitem__ = _deny_mutation
+    clear = _deny_mutation
+    pop = _deny_mutation
+    popitem = _deny_mutation
+    setdefault = _deny_mutation
+    update = _deny_mutation
+    __ior__ = _deny_mutation
+
+    def __deepcopy__(self, memo: dict[int, object]) -> _ImmutableLabels:
+        del memo
+        return type(self)(self)
+
+    def __reduce_ex__(self, protocol: SupportsIndex, /) -> str | tuple[Any, ...]:
+        del protocol
+        return type(self), (dict(self),)
+
+
 @dataclass(frozen=True)
 class SandboxRef:
     id: str
     name: str
+    workspace: str
     status: SandboxStatusRef
+    # Excluded from equality/hash to preserve the original identity while the
+    # immutable mapping remains safe for deepcopy, pickle, and asdict.
+    labels: Mapping[str, str] = field(default_factory=_ImmutableLabels, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "labels", _ImmutableLabels(self.labels))
 
     @property
     def phase(self) -> int:
@@ -145,66 +177,6 @@ class SandboxRef:
     @property
     def current_policy_version(self) -> int:
         return self.status.current_policy_version
-
-
-@dataclass(frozen=True)
-class SandboxFull:
-    id: str
-    name: str
-    namespace: str
-    phase: int
-    spec: object  # datamodel_pb2.SandboxSpec
-    status: object  # datamodel_pb2.SandboxStatus
-    created_at_ms: int
-    current_policy_version: int
-
-
-@dataclass(frozen=True)
-class ProviderRef:
-    id: str
-    name: str
-    type: str
-    config: dict[str, str]
-    # Names of stored credentials on the gateway. Values are intentionally
-    # not exposed — the gateway redacts them on the wire. Callers needing
-    # to verify a provider holds a specific credential (e.g. SLACK_BOT_TOKEN)
-    # check membership in credential_keys.
-    credential_keys: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class DraftChunkRef:
-    id: str
-    status: str
-    rule_name: str
-    binary: str
-    rationale: str
-    security_notes: str
-    confidence: float
-    hit_count: int
-    endpoints: list[object]  # list of NetworkEndpoint proto messages
-
-
-@dataclass(frozen=True)
-class DraftPolicyResult:
-    chunks: list[DraftChunkRef]
-    rolling_summary: str
-    draft_version: int
-    last_analyzed_at_ms: int
-
-
-@dataclass(frozen=True)
-class PolicyUpdateResult:
-    version: int
-    policy_hash: str
-
-
-@dataclass(frozen=True)
-class ApproveAllResult:
-    version: int
-    policy_hash: str
-    chunks_approved: int
-    chunks_skipped: int
 
 
 @dataclass(frozen=True)
@@ -228,6 +200,7 @@ class SandboxSession:
     def __init__(self, client: SandboxClient, sandbox: SandboxRef) -> None:
         self._client = client
         self.sandbox = sandbox
+        self._workspace = sandbox.workspace
 
     @property
     def id(self) -> str:
@@ -276,7 +249,15 @@ class SandboxSession:
         )
 
     def delete(self) -> bool:
-        return self._client.delete(self.sandbox.name)
+        return self._client.delete(self.sandbox.name, workspace=self._workspace)
+
+    def stop(self) -> SandboxRef:
+        self.sandbox = self._client.stop(self.sandbox.name, workspace=self._workspace)
+        return self.sandbox
+
+    def start(self) -> SandboxRef:
+        self.sandbox = self._client.start(self.sandbox.name, workspace=self._workspace)
+        return self.sandbox
 
 
 class SandboxClient:
@@ -380,7 +361,7 @@ class SandboxClient:
         gateway_dir = _xdg_config_home() / "openshell" / "gateways" / cluster_name
         metadata_path = gateway_dir / "metadata.json"
         try:
-            metadata = json.loads(metadata_path.read_text())
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             raise SandboxError(f"gateway '{cluster_name}' not found") from None
         if "gateway_endpoint" not in metadata:
@@ -458,11 +439,19 @@ class SandboxClient:
     def create(
         self,
         *,
+        workspace: str,
         spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
         response = self._stub.CreateSandbox(
-            openshell_pb2.CreateSandboxRequest(spec=request_spec),
+            openshell_pb2.CreateSandboxRequest(
+                spec=request_spec,
+                name=name or "",
+                labels=dict(labels) if labels else {},
+                workspace=workspace,
+            ),
             timeout=self._timeout,
         )
         sandbox_ref = _sandbox_ref(response.sandbox)
@@ -473,368 +462,120 @@ class SandboxClient:
     def create_session(
         self,
         *,
+        workspace: str,
         spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
     ) -> SandboxSession:
-        return SandboxSession(self, self.create(spec=spec))
+        return SandboxSession(
+            self, self.create(workspace=workspace, spec=spec, name=name, labels=labels)
+        )
 
-    def get(self, sandbox_name: str) -> SandboxRef:
+    def get(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.GetSandbox(
-            openshell_pb2.GetSandboxRequest(name=sandbox_name),
+            openshell_pb2.GetSandboxRequest(name=sandbox_name, workspace=workspace),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
 
-    def get_session(self, sandbox_name: str) -> SandboxSession:
-        return SandboxSession(self, self.get(sandbox_name))
+    def get_session(self, sandbox_name: str, *, workspace: str) -> SandboxSession:
+        return SandboxSession(self, self.get(sandbox_name, workspace=workspace))
 
-    def list(self, *, limit: int = 100, offset: int = 0) -> builtins.list[SandboxRef]:
-        response = self._stub.ListSandboxes(
-            openshell_pb2.ListSandboxesRequest(limit=limit, offset=offset),
-            timeout=self._timeout,
+    def list(
+        self,
+        *,
+        workspace: str,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[SandboxRef]:
+        request = openshell_pb2.ListSandboxesRequest(
+            workspace=workspace,
+            limit=limit,
+            offset=offset,
+            label_selector=label_selector or "",
         )
+        response = self._stub.ListSandboxes(request, timeout=self._timeout)
         return [_sandbox_ref(item) for item in response.sandboxes]
 
-    def list_ids(self, *, limit: int = 100, offset: int = 0) -> builtins.list[str]:
-        return [item.id for item in self.list(limit=limit, offset=offset)]
+    def list_for_all_workspaces(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[SandboxRef]:
+        request = openshell_pb2.ListSandboxesRequest(
+            all_workspaces=True,
+            limit=limit,
+            offset=offset,
+            label_selector=label_selector or "",
+        )
+        response = self._stub.ListSandboxes(request, timeout=self._timeout)
+        return [_sandbox_ref(item) for item in response.sandboxes]
 
-    def delete(self, sandbox_name: str) -> bool:
+    def list_ids(
+        self,
+        *,
+        workspace: str,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[str]:
+        return [
+            item.id
+            for item in self.list(
+                workspace=workspace,
+                limit=limit,
+                offset=offset,
+                label_selector=label_selector,
+            )
+        ]
+
+    def list_ids_for_all_workspaces(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[str]:
+        return [
+            item.id
+            for item in self.list_for_all_workspaces(
+                limit=limit,
+                offset=offset,
+                label_selector=label_selector,
+            )
+        ]
+
+    def delete(self, sandbox_name: str, *, workspace: str) -> bool:
         response = self._stub.DeleteSandbox(
-            openshell_pb2.DeleteSandboxRequest(name=sandbox_name),
+            openshell_pb2.DeleteSandboxRequest(name=sandbox_name, workspace=workspace),
             timeout=self._timeout,
         )
         return bool(response.deleted)
 
-    def get_full(self, sandbox_name: str) -> SandboxFull:
-        response = self._stub.GetSandbox(
-            openshell_pb2.GetSandboxRequest(name=sandbox_name),
+    def stop(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
+        response = self._stub.StopSandbox(
+            openshell_pb2.StopSandboxRequest(name=sandbox_name, workspace=workspace),
             timeout=self._timeout,
         )
-        sb = response.sandbox
-        return SandboxFull(
-            id=sb.metadata.id if sb.metadata else "",
-            name=sb.metadata.name if sb.metadata else "",
-            namespace="",  # removed from proto; retained in SandboxFull for compat
-            phase=sb.status.phase if sb.status else 0,
-            spec=sb.spec,
-            status=sb.status,
-            created_at_ms=sb.metadata.created_at_ms if sb.metadata else 0,
-            current_policy_version=sb.status.current_policy_version if sb.status else 0,
-        )
+        return _sandbox_ref(response.sandbox)
 
-    # ------------------------------------------------------------------
-    # Provider CRUD
-    # ------------------------------------------------------------------
-
-    def create_provider(
-        self,
-        *,
-        name: str,
-        provider_type: str,
-        credentials: dict[str, str] | None = None,
-        config: dict[str, str] | None = None,
-    ) -> ProviderRef:
-        provider = datamodel_pb2.Provider(
-            metadata=datamodel_pb2.ObjectMeta(name=name),
-            type=provider_type,
-            credentials=credentials or {},
-            config=config or {},
-        )
-        response = self._stub.CreateProvider(
-            openshell_pb2.CreateProviderRequest(provider=provider),
+    def start(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
+        response = self._stub.StartSandbox(
+            openshell_pb2.StartSandboxRequest(name=sandbox_name, workspace=workspace),
             timeout=self._timeout,
         )
-        return _provider_ref(response.provider)
+        return _sandbox_ref(response.sandbox)
 
-    def get_provider(self, name: str) -> ProviderRef:
-        response = self._stub.GetProvider(
-            openshell_pb2.GetProviderRequest(name=name),
-            timeout=self._timeout,
-        )
-        return _provider_ref(response.provider)
-
-    def list_providers(
-        self, *, limit: int = 100, offset: int = 0
-    ) -> builtins.list[ProviderRef]:
-        response = self._stub.ListProviders(
-            openshell_pb2.ListProvidersRequest(limit=limit, offset=offset),
-            timeout=self._timeout,
-        )
-        return [_provider_ref(p) for p in response.providers]
-
-    def update_provider(
-        self,
-        *,
-        name: str,
-        provider_type: str,
-        credentials: dict[str, str] | None = None,
-        config: dict[str, str] | None = None,
-    ) -> ProviderRef:
-        provider = datamodel_pb2.Provider(
-            metadata=datamodel_pb2.ObjectMeta(name=name),
-            type=provider_type,
-            credentials=credentials or {},
-            config=config or {},
-        )
-        response = self._stub.UpdateProvider(
-            openshell_pb2.UpdateProviderRequest(provider=provider),
-            timeout=self._timeout,
-        )
-        return _provider_ref(response.provider)
-
-    def delete_provider(self, name: str) -> bool:
-        response = self._stub.DeleteProvider(
-            openshell_pb2.DeleteProviderRequest(name=name),
-            timeout=self._timeout,
-        )
-        return bool(response.deleted)
-
-    # ------------------------------------------------------------------
-    # Provider profiles
-    # ------------------------------------------------------------------
-
-    def list_provider_profiles(
-        self, *, limit: int = 100, offset: int = 0
-    ) -> builtins.list[object]:
-        response = self._stub.ListProviderProfiles(
-            openshell_pb2.ListProviderProfilesRequest(limit=limit, offset=offset),
-            timeout=self._timeout,
-        )
-        return list(response.profiles)
-
-    def get_provider_profile(self, profile_id: str) -> object:
-        response = self._stub.GetProviderProfile(
-            openshell_pb2.GetProviderProfileRequest(id=profile_id),
-            timeout=self._timeout,
-        )
-        return response.profile
-
-    def import_provider_profiles(
-        self, profiles: builtins.list[dict]
-    ) -> openshell_pb2.ImportProviderProfilesResponse:
-        items = [
-            openshell_pb2.ProviderProfileImportItem(
-                profile=json_format.ParseDict(p, openshell_pb2.ProviderProfile()),
-                source=p.get("source", ""),
-            )
-            for p in profiles
-        ]
-        return self._stub.ImportProviderProfiles(
-            openshell_pb2.ImportProviderProfilesRequest(profiles=items),
-            timeout=self._timeout,
-        )
-
-    def lint_provider_profiles(
-        self, profiles: builtins.list[dict]
-    ) -> openshell_pb2.LintProviderProfilesResponse:
-        items = [
-            openshell_pb2.ProviderProfileImportItem(
-                profile=json_format.ParseDict(p, openshell_pb2.ProviderProfile()),
-                source=p.get("source", ""),
-            )
-            for p in profiles
-        ]
-        return self._stub.LintProviderProfiles(
-            openshell_pb2.LintProviderProfilesRequest(profiles=items),
-            timeout=self._timeout,
-        )
-
-    def delete_provider_profile(self, profile_id: str) -> bool:
-        response = self._stub.DeleteProviderProfile(
-            openshell_pb2.DeleteProviderProfileRequest(id=profile_id),
-            timeout=self._timeout,
-        )
-        return bool(response.deleted)
-
-    # ------------------------------------------------------------------
-    # Provider credential refresh
-    # ------------------------------------------------------------------
-
-    def configure_provider_refresh(
-        self,
-        provider_name: str,
-        credential_key: str,
-        strategy: str = "",
-        *,
-        material: "dict[str, str] | None" = None,
-        secret_material_keys: "list[str] | None" = None,
-        expires_at_ms: "int | None" = None,
-    ) -> object:
-        """Configure gateway-owned refresh material for one provider credential."""
-        _strategy_map = {
-            "": 0,
-            "static": 1,
-            "external": 2,
-            "oauth2_refresh_token": 3,
-            "oauth2-refresh-token": 3,
-            "oauth2_client_credentials": 4,
-            "oauth2-client-credentials": 4,
-            "google_service_account_jwt": 5,
-            "google-service-account-jwt": 5,
-        }
-        req = openshell_pb2.ConfigureProviderRefreshRequest(
-            provider=provider_name,
-            credential_key=credential_key,
-            strategy=_strategy_map.get(strategy, 0),
-            material=material or {},
-            secret_material_keys=secret_material_keys or [],
-        )
-        if expires_at_ms is not None:
-            req.expires_at_ms = expires_at_ms
-        return self._stub.ConfigureProviderRefresh(req, timeout=self._timeout)
-
-    def get_provider_refresh_status(
-        self,
-        provider_name: str,
-        credential_key: str = "",
-    ) -> "list[object]":
-        """Get credential refresh status for a provider."""
-        response = self._stub.GetProviderRefreshStatus(
-            openshell_pb2.GetProviderRefreshStatusRequest(
-                provider=provider_name,
-                credential_key=credential_key,
-            ),
-            timeout=self._timeout,
-        )
-        return list(response.credentials)
-
-    def rotate_provider_credential(
-        self,
-        provider_name: str,
-        credential_key: str,
-    ) -> object:
-        """Force an immediate credential rotation for a provider."""
-        return self._stub.RotateProviderCredential(
-            openshell_pb2.RotateProviderCredentialRequest(
-                provider=provider_name,
-                credential_key=credential_key,
-            ),
-            timeout=self._timeout,
-        )
-
-    def delete_provider_refresh(
-        self,
-        provider_name: str,
-        credential_key: str,
-    ) -> bool:
-        """Remove a credential refresh configuration."""
-        response = self._stub.DeleteProviderRefresh(
-            openshell_pb2.DeleteProviderRefreshRequest(
-                provider=provider_name,
-                credential_key=credential_key,
-            ),
-            timeout=self._timeout,
-        )
-        return bool(response.deleted)
-
-    # ------------------------------------------------------------------
-    # Draft policy recommendations
-    # ------------------------------------------------------------------
-
-    def get_draft_policy(
-        self,
-        sandbox_name: str,
-        *,
-        status_filter: str = "",
-    ) -> DraftPolicyResult:
-        response = self._stub.GetDraftPolicy(
-            openshell_pb2.GetDraftPolicyRequest(
-                name=sandbox_name,
-                status_filter=status_filter,
-            ),
-            timeout=self._timeout,
-        )
-        return DraftPolicyResult(
-            chunks=[_draft_chunk_ref(c) for c in response.chunks],
-            rolling_summary=response.rolling_summary,
-            draft_version=response.draft_version,
-            last_analyzed_at_ms=response.last_analyzed_at_ms,
-        )
-
-    def approve_draft_chunk(
-        self,
-        sandbox_name: str,
-        chunk_id: str,
-    ) -> PolicyUpdateResult:
-        response = self._stub.ApproveDraftChunk(
-            openshell_pb2.ApproveDraftChunkRequest(
-                name=sandbox_name,
-                chunk_id=chunk_id,
-            ),
-            timeout=self._timeout,
-        )
-        return PolicyUpdateResult(
-            version=response.policy_version,
-            policy_hash=response.policy_hash,
-        )
-
-    def reject_draft_chunk(
-        self,
-        sandbox_name: str,
-        chunk_id: str,
-        *,
-        reason: str = "",
+    def wait_deleted(
+        self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 60.0
     ) -> None:
-        self._stub.RejectDraftChunk(
-            openshell_pb2.RejectDraftChunkRequest(
-                name=sandbox_name,
-                chunk_id=chunk_id,
-                reason=reason,
-            ),
-            timeout=self._timeout,
-        )
-
-    def approve_all_draft_chunks(
-        self,
-        sandbox_name: str,
-        *,
-        include_security_flagged: bool = False,
-    ) -> ApproveAllResult:
-        response = self._stub.ApproveAllDraftChunks(
-            openshell_pb2.ApproveAllDraftChunksRequest(
-                name=sandbox_name,
-                include_security_flagged=include_security_flagged,
-            ),
-            timeout=self._timeout,
-        )
-        return ApproveAllResult(
-            version=response.policy_version,
-            policy_hash=response.policy_hash,
-            chunks_approved=response.chunks_approved,
-            chunks_skipped=response.chunks_skipped,
-        )
-
-    # ------------------------------------------------------------------
-    # Policy updates
-    # ------------------------------------------------------------------
-
-    def update_config(
-        self,
-        sandbox_name: str,
-        policy: object,
-    ) -> PolicyUpdateResult:
-        from ._proto import sandbox_pb2  # noqa: local import to avoid circular
-
-        if not isinstance(policy, sandbox_pb2.SandboxPolicy):
-            raise TypeError(
-                f"policy must be a SandboxPolicy proto message, got {type(policy)}"
-            )
-        response = self._stub.UpdateConfig(
-            openshell_pb2.UpdateConfigRequest(
-                name=sandbox_name,
-                policy=policy,
-            ),
-            timeout=self._timeout,
-        )
-        return PolicyUpdateResult(
-            version=response.version,
-            policy_hash=response.policy_hash,
-        )
-
-    def wait_deleted(self, sandbox_name: str, *, timeout_seconds: float = 60.0) -> None:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             try:
-                self.get(sandbox_name)
+                self.get(sandbox_name, workspace=workspace)
             except grpc.RpcError as exc:
                 if (
                     isinstance(exc, grpc.Call)
@@ -846,17 +587,47 @@ class SandboxClient:
         raise SandboxError(f"sandbox {sandbox_name} was not deleted within timeout")
 
     def wait_ready(
-        self, sandbox_name: str, *, timeout_seconds: float = 300.0
+        self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 300.0
+    ) -> SandboxRef:
+        return self._wait_for_phase(
+            sandbox_name,
+            workspace=workspace,
+            target_phase=openshell_pb2.SANDBOX_PHASE_READY,
+            target_name="ready",
+            timeout_seconds=timeout_seconds,
+        )
+
+    def wait_stopped(
+        self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 300.0
+    ) -> SandboxRef:
+        return self._wait_for_phase(
+            sandbox_name,
+            workspace=workspace,
+            target_phase=openshell_pb2.SANDBOX_PHASE_STOPPED,
+            target_name="stopped",
+            timeout_seconds=timeout_seconds,
+        )
+
+    def _wait_for_phase(
+        self,
+        sandbox_name: str,
+        *,
+        workspace: str,
+        target_phase: int,
+        target_name: str,
+        timeout_seconds: float,
     ) -> SandboxRef:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
-            sandbox = self.get(sandbox_name)
-            if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_READY:
+            sandbox = self.get(sandbox_name, workspace=workspace)
+            if sandbox.status.phase == target_phase:
                 return sandbox
             if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_ERROR:
                 raise SandboxError(f"sandbox {sandbox_name} entered error phase")
             time.sleep(1)
-        raise SandboxError(f"sandbox {sandbox_name} was not ready within timeout")
+        raise SandboxError(
+            f"sandbox {sandbox_name} was not {target_name} within timeout"
+        )
 
     def exec_stream(
         self,
@@ -974,14 +745,14 @@ class SandboxClient:
 
 
 @dataclass(frozen=True)
-class ClusterInferenceConfig:
+class InferenceRouteConfig:
     provider_name: str
     model_id: str
     version: int
 
 
 class InferenceRouteClient:
-    """gRPC client for cluster-level inference configuration."""
+    """gRPC client for workspace-scoped inference route configuration."""
 
     def __init__(self, channel: grpc.Channel, *, timeout: float = 30.0) -> None:
         self._stub = inference_pb2_grpc.InferenceStub(channel)
@@ -991,37 +762,128 @@ class InferenceRouteClient:
     def from_sandbox_client(cls, client: SandboxClient) -> InferenceRouteClient:
         return cls(client._channel, timeout=client._timeout)
 
-    def set_cluster(
+    def set_route(
         self,
         *,
+        workspace: str,
         provider_name: str,
         model_id: str,
         no_verify: bool = False,
-    ) -> ClusterInferenceConfig:
-        response = self._stub.SetClusterInference(
-            inference_pb2.SetClusterInferenceRequest(
+    ) -> InferenceRouteConfig:
+        response = self._stub.SetInferenceRoute(
+            inference_pb2.SetInferenceRouteRequest(
+                workspace=workspace,
                 provider_name=provider_name,
                 model_id=model_id,
                 no_verify=no_verify,
             ),
             timeout=self._timeout,
         )
-        return ClusterInferenceConfig(
+        return InferenceRouteConfig(
             provider_name=response.provider_name,
             model_id=response.model_id,
             version=response.version,
         )
 
-    def get_cluster(self) -> ClusterInferenceConfig:
-        response = self._stub.GetClusterInference(
-            inference_pb2.GetClusterInferenceRequest(),
+    def get_route(self, *, workspace: str) -> InferenceRouteConfig:
+        response = self._stub.GetInferenceRoute(
+            inference_pb2.GetInferenceRouteRequest(workspace=workspace),
             timeout=self._timeout,
         )
-        return ClusterInferenceConfig(
+        return InferenceRouteConfig(
             provider_name=response.provider_name,
             model_id=response.model_id,
             version=response.version,
         )
+
+    def delete_route(
+        self,
+        *,
+        workspace: str,
+        route_name: str = "",
+    ) -> bool:
+        response = self._stub.DeleteInferenceRoute(
+            inference_pb2.DeleteInferenceRouteRequest(
+                workspace=workspace,
+                route_name=route_name,
+            ),
+            timeout=self._timeout,
+        )
+        return response.deleted
+
+
+@dataclass(frozen=True)
+class WorkspaceRef:
+    name: str
+    phase: str
+    labels: dict[str, str]
+
+
+def _workspace_ref(ws: datamodel_pb2.Workspace) -> WorkspaceRef:
+    meta = ws.metadata
+    return WorkspaceRef(
+        name=meta.name,
+        phase=datamodel_pb2.WorkspacePhase.Name(ws.status.phase),
+        labels=dict(meta.labels),
+    )
+
+
+class WorkspaceClient:
+    """gRPC client for workspace lifecycle operations."""
+
+    def __init__(self, channel: grpc.Channel, *, timeout: float = 30.0) -> None:
+        self._stub = openshell_pb2_grpc.OpenShellStub(channel)
+        self._timeout = timeout
+
+    @classmethod
+    def from_sandbox_client(cls, client: SandboxClient) -> WorkspaceClient:
+        return cls(client._channel, timeout=client._timeout)
+
+    def create(
+        self,
+        name: str,
+        *,
+        labels: Mapping[str, str] | None = None,
+    ) -> WorkspaceRef:
+        response = self._stub.CreateWorkspace(
+            openshell_pb2.CreateWorkspaceRequest(
+                name=name,
+                labels=dict(labels) if labels else {},
+            ),
+            timeout=self._timeout,
+        )
+        return _workspace_ref(response.workspace)
+
+    def get(self, name: str) -> WorkspaceRef:
+        response = self._stub.GetWorkspace(
+            openshell_pb2.GetWorkspaceRequest(name=name),
+            timeout=self._timeout,
+        )
+        return _workspace_ref(response.workspace)
+
+    def list(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[WorkspaceRef]:
+        response = self._stub.ListWorkspaces(
+            openshell_pb2.ListWorkspacesRequest(
+                limit=limit,
+                offset=offset,
+                label_selector=label_selector or "",
+            ),
+            timeout=self._timeout,
+        )
+        return [_workspace_ref(ws) for ws in response.workspaces]
+
+    def delete(self, name: str) -> bool:
+        response = self._stub.DeleteWorkspace(
+            openshell_pb2.DeleteWorkspaceRequest(name=name),
+            timeout=self._timeout,
+        )
+        return response.deleted
 
 
 class Sandbox:
@@ -1030,10 +892,13 @@ class Sandbox:
     def __init__(
         self,
         *,
+        workspace: str,
         cluster: str | None = None,
         sandbox: str | SandboxRef | None = None,
         delete_on_exit: bool = True,
         spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
         timeout: float = 30.0,
         ready_timeout_seconds: float = 120.0,
         auto_refresh: bool = True,
@@ -1049,10 +914,14 @@ class Sandbox:
         OIDC-protected gateways (e.g. passing `insecure=True` for a
         self-signed dev IdP). Non-OIDC gateways ignore them.
         """
+        self._workspace = workspace
         self._cluster = cluster
         self._sandbox_input = sandbox
         self._delete_on_exit = delete_on_exit
         self._spec = spec
+        self._name = name
+        # Copy so later caller mutation cannot change what gets sent on enter.
+        self._labels = dict(labels) if labels is not None else None
         self._timeout = timeout
         self._ready_timeout_seconds = ready_timeout_seconds
         self._auto_refresh = auto_refresh
@@ -1074,6 +943,15 @@ class Sandbox:
         return self._session.sandbox
 
     def __enter__(self) -> Sandbox:
+        # Creation metadata cannot be applied when attaching to an existing
+        # sandbox; reject it before opening a connection.
+        if self._sandbox_input is not None and (
+            self._name is not None or self._labels is not None
+        ):
+            raise SandboxError(
+                "name and labels cannot be set when attaching to an existing sandbox"
+            )
+
         client = SandboxClient.from_active_cluster(
             cluster=self._cluster,
             timeout=self._timeout,
@@ -1084,14 +962,24 @@ class Sandbox:
         self._client = client
 
         if self._sandbox_input is None:
-            self._session = client.create_session(spec=self._spec)
+            self._session = client.create_session(
+                workspace=self._workspace,
+                spec=self._spec,
+                name=self._name,
+                labels=self._labels,
+            )
         elif isinstance(self._sandbox_input, SandboxRef):
             self._session = SandboxSession(client, self._sandbox_input)
         else:
-            self._session = client.get_session(self._sandbox_input)
+            self._session = client.get_session(
+                self._sandbox_input, workspace=self._workspace
+            )
+
+        self._workspace = getattr(self._session, "_workspace", self._workspace)
 
         ready = client.wait_ready(
             self._session.sandbox.name,
+            workspace=self._workspace,
             timeout_seconds=self._ready_timeout_seconds,
         )
         self._session = SandboxSession(client, ready)
@@ -1108,7 +996,10 @@ class Sandbox:
                 try:
                     deleted = self._session.delete()
                     if deleted:
-                        self._client.wait_deleted(self._session.sandbox.name)
+                        self._client.wait_deleted(
+                            self._session.sandbox.name,
+                            workspace=self._workspace,
+                        )
                 except grpc.RpcError as exc:
                     if (
                         not isinstance(exc, grpc.Call)
@@ -1197,34 +1088,12 @@ def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
     return SandboxRef(
         id=sandbox.metadata.id if sandbox.metadata else "",
         name=sandbox.metadata.name if sandbox.metadata else "",
+        workspace=sandbox.metadata.workspace if sandbox.metadata else "",
         status=SandboxStatusRef(
             phase=status.phase if status else 0,
             current_policy_version=status.current_policy_version if status else 0,
         ),
-    )
-
-
-def _provider_ref(provider: openshell_pb2.Provider) -> ProviderRef:
-    return ProviderRef(
-        id=provider.metadata.id if provider.metadata else "",
-        name=provider.metadata.name if provider.metadata else "",
-        type=provider.type,
-        config=dict(provider.config),
-        credential_keys=tuple(sorted(provider.credentials.keys())),
-    )
-
-
-def _draft_chunk_ref(chunk: object) -> DraftChunkRef:
-    return DraftChunkRef(
-        id=chunk.id,
-        status=chunk.status,
-        rule_name=chunk.rule_name,
-        binary=chunk.binary,
-        rationale=chunk.rationale,
-        security_notes=chunk.security_notes,
-        confidence=chunk.confidence,
-        hit_count=chunk.hit_count,
-        endpoints=list(chunk.proposed_rule.endpoints) if chunk.proposed_rule else [],
+        labels=sandbox.metadata.labels if sandbox.metadata else {},
     )
 
 
@@ -1249,6 +1118,40 @@ def _xdg_config_home() -> pathlib.Path:
 # matches `openshell-bootstrap::oidc_token::is_token_expired`.
 _OIDC_TOKEN_EXPIRY_GRACE_SECONDS = 30
 
+_IS_WINDOWS = os.name == "nt"
+_WINDOWS_REPLACE_RETRYABLE_ERRORS = frozenset({5, 32})
+_WINDOWS_REPLACE_TIMEOUT_SECONDS = 0.25
+_WINDOWS_REPLACE_INITIAL_DELAY_SECONDS = 0.005
+_WINDOWS_REPLACE_MAX_DELAY_SECONDS = 0.05
+_WINDOWS_REPLACE_LOCK = threading.Lock()
+
+
+def _atomic_replace(source: pathlib.Path, destination: pathlib.Path) -> None:
+    """Atomically replace a file, retrying transient Windows sharing errors."""
+    if not _IS_WINDOWS:
+        source.replace(destination)
+        return
+
+    # Serialize writers in this process. The retry still handles other
+    # processes (including the Rust CLI) and filesystem scanners that briefly
+    # open the destination without delete sharing.
+    with _WINDOWS_REPLACE_LOCK:
+        deadline = time.monotonic() + _WINDOWS_REPLACE_TIMEOUT_SECONDS
+        delay = _WINDOWS_REPLACE_INITIAL_DELAY_SECONDS
+        while True:
+            try:
+                source.replace(destination)
+                return
+            except PermissionError as error:
+                winerror = getattr(error, "winerror", None)
+                retryable = winerror in _WINDOWS_REPLACE_RETRYABLE_ERRORS or (
+                    winerror is None and error.errno == errno.EACCES
+                )
+                if not retryable or time.monotonic() >= deadline:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, _WINDOWS_REPLACE_MAX_DELAY_SECONDS)
+
 
 def _read_oidc_token_bundle(gateway_dir: pathlib.Path) -> dict | None:
     """Read and parse `oidc_token.json` for a gateway.
@@ -1258,10 +1161,10 @@ def _read_oidc_token_bundle(gateway_dir: pathlib.Path) -> dict | None:
     """
     token_path = gateway_dir / "oidc_token.json"
     try:
-        return json.loads(token_path.read_text())
+        return json.loads(token_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
 
 
@@ -1711,11 +1614,11 @@ class _OidcRefresher:
         )
         tmp_path = pathlib.Path(tmp_name)
         try:
-            with os.fdopen(fd, "w") as f:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(payload)
             with contextlib.suppress(OSError):
                 tmp_path.chmod(0o600)
-            tmp_path.replace(path)
+            _atomic_replace(tmp_path, path)
         except BaseException:
             # Clean up our tmp on failure so we don't leave orphaned
             # `.oidc_token.<rand>.tmp` files lying around. The replace
@@ -1786,7 +1689,7 @@ def _resolve_active_cluster() -> str:
         return env_gateway
     active_file = _xdg_config_home() / "openshell" / "active_gateway"
     try:
-        value = active_file.read_text().strip()
+        value = active_file.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         raise SandboxError("no active gateway configured") from None
     if value == "":

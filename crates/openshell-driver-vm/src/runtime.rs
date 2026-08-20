@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use crate::{embedded_runtime, ffi, nft_ruleset, procguard, rootfs};
 
 pub const VM_RUNTIME_DIR_ENV: &str = "OPENSHELL_VM_RUNTIME_DIR";
+const KRUN_INIT_PID1_ENV: &str = "KRUN_INIT_PID1=1";
 
 /// PID of the VM worker process (libkrun fork or QEMU). Zero when not running.
 /// Used by the SIGTERM/SIGINT handler to forward signals to the VM.
@@ -48,6 +49,7 @@ pub struct VmLaunchConfig {
     pub root_disk: PathBuf,
     pub overlay_disk: PathBuf,
     pub image_disk: Option<PathBuf>,
+    pub kernel_image: Option<PathBuf>,
     pub vcpus: u8,
     pub mem_mib: u32,
     pub exec_path: String,
@@ -126,12 +128,15 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     let guest_env = qemu_guest_env_vars(config, host_dns_server());
     write_guest_env_file(&config.overlay_disk, &guest_env)?;
 
-    let runtime_dir = qemu_runtime_dir()?;
     let gw_port = config.gateway_port.unwrap_or(0);
     setup_tap_networking(tap_device, host_ip, gw_port)?;
     let mut tap_guard = TapGuard::new(tap_device.to_string(), host_ip.to_string(), gw_port);
 
-    let vmlinux = runtime_dir.join("vmlinux");
+    let vmlinux = if let Some(kernel_image) = &config.kernel_image {
+        kernel_image.clone()
+    } else {
+        qemu_runtime_dir()?.join("vmlinux")
+    };
     if !vmlinux.is_file() {
         return Err(format!("VM kernel not found: {}", vmlinux.display()));
     }
@@ -648,6 +653,12 @@ fn procguard_kill_children() {
 }
 
 fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
+    if let Some(kernel_image) = &config.kernel_image {
+        return Err(format!(
+            "selected kernel image is not supported by this VM backend: {}",
+            kernel_image.display()
+        ));
+    }
     if !config.root_disk.is_file() {
         return Err(format!(
             "root disk image not found: {}",
@@ -823,15 +834,7 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
 
     vm.set_console_output(&config.console_output)?;
 
-    let env = if config.env.is_empty() {
-        vec![
-            "HOME=/root".to_string(),
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
-            "TERM=xterm".to_string(),
-        ]
-    } else {
-        config.env.clone()
-    };
+    let env = libkrun_guest_env(config);
     vm.set_exec(&config.exec_path, &config.args, &env)?;
 
     let pid = unsafe { libc::fork() };
@@ -877,6 +880,26 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
             }
         }
     }
+}
+
+fn libkrun_guest_env(config: &VmLaunchConfig) -> Vec<String> {
+    let mut env = if config.env.is_empty() {
+        vec![
+            "HOME=/root".to_string(),
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+            "TERM=xterm".to_string(),
+        ]
+    } else {
+        config.env.clone()
+    };
+
+    // libkrun normally keeps /init.krun as PID 1 and forks the configured
+    // executable. OpenShell's guest init is itself an init process and ends
+    // by exec'ing the supervisor, so ask libkrun to exec it directly. Keep
+    // this driver-owned setting authoritative over sandbox image/user env.
+    env.retain(|value| !value.starts_with("KRUN_INIT_PID1="));
+    env.push(KRUN_INIT_PID1_ENV.to_string());
+    env
 }
 
 pub fn validate_runtime_dir(dir: &Path) -> Result<(), String> {
@@ -1397,6 +1420,7 @@ mod tests {
             root_disk: PathBuf::from("/rootfs.ext4"),
             overlay_disk: PathBuf::from("/overlay.ext4"),
             image_disk: None,
+            kernel_image: None,
             vcpus: 2,
             mem_mib: 2048,
             exec_path: "/srv/openshell-vm-sandbox-init.sh".to_string(),
@@ -1425,6 +1449,44 @@ mod tests {
         assert!(env.contains(&"VM_NET_GW=10.0.128.1".to_string()));
         assert!(env.contains(&"VM_NET_DNS=1.1.1.1".to_string()));
         assert!(env.contains(&"GPU_ENABLED=true".to_string()));
+    }
+
+    #[test]
+    fn libkrun_guest_env_runs_guest_init_as_pid_one() {
+        let env = libkrun_guest_env(&qemu_config());
+
+        assert!(env.contains(&"OPENSHELL_ENDPOINT=http://10.0.128.1:8080".to_string()));
+        assert!(env.contains(&KRUN_INIT_PID1_ENV.to_string()));
+    }
+
+    #[test]
+    fn libkrun_guest_env_overrides_caller_pid_one_setting() {
+        let mut config = qemu_config();
+        config.env.extend([
+            "KRUN_INIT_PID1=0".to_string(),
+            "KRUN_INIT_PID1=unexpected".to_string(),
+        ]);
+
+        let env = libkrun_guest_env(&config);
+        let pid_one_settings = env
+            .iter()
+            .filter(|value| value.starts_with("KRUN_INIT_PID1="))
+            .collect::<Vec<_>>();
+
+        assert_eq!(pid_one_settings.len(), 1);
+        assert_eq!(pid_one_settings[0], KRUN_INIT_PID1_ENV);
+    }
+
+    #[test]
+    fn libkrun_guest_env_keeps_defaults_when_no_env_is_configured() {
+        let mut config = qemu_config();
+        config.env.clear();
+
+        let env = libkrun_guest_env(&config);
+
+        assert!(env.contains(&"HOME=/root".to_string()));
+        assert!(env.contains(&"TERM=xterm".to_string()));
+        assert!(env.contains(&KRUN_INIT_PID1_ENV.to_string()));
     }
 
     #[test]

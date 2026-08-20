@@ -13,7 +13,15 @@
 #
 # HTTPS endpoint-only mode is intentionally unsupported here. Use a named
 # gateway config when mTLS materials are needed.
-
+#
+# Sandbox image overrides:
+#   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE=...
+#   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY=Always|IfNotPresent|Never
+#
+# The default community sandbox image uses :latest. This wrapper refreshes it
+# before starting the gateway, while the Docker driver defaults to IfNotPresent
+# so local Dockerfile-built images remain usable.
+#
 set -euo pipefail
 
 if [ "$#" -eq 0 ]; then
@@ -26,6 +34,39 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${ROOT}/e2e/support/gateway-common.sh"
 
 e2e_preserve_mise_dirs
+
+require_container_engine_lane() {
+  local lane=$1
+  local label=$2
+  local selected_engine selected_driver
+
+  if [ -n "${OPENSHELL_E2E_CONTAINER_ENGINE:-}" ]; then
+    echo "ERROR: OPENSHELL_E2E_CONTAINER_ENGINE is no longer supported." >&2
+    echo "       Set CONTAINER_ENGINE=${lane} for the ${label} e2e lane, or unset it." >&2
+    exit 2
+  fi
+  selected_engine="$(printf '%s' "${CONTAINER_ENGINE:-}" | tr '[:upper:]' '[:lower:]')"
+  selected_driver="$(printf '%s' "${OPENSHELL_E2E_DRIVER:-}" | tr '[:upper:]' '[:lower:]')"
+
+  if [ -n "${selected_engine}" ] && [ "${selected_engine}" != "${lane}" ]; then
+    echo "ERROR: CONTAINER_ENGINE=${CONTAINER_ENGINE} conflicts with the ${label} e2e lane." >&2
+    echo "       Set CONTAINER_ENGINE=${lane} or unset CONTAINER_ENGINE." >&2
+    exit 2
+  fi
+  if [ -n "${selected_driver}" ] && [ "${selected_driver}" != "${lane}" ]; then
+    echo "ERROR: OPENSHELL_E2E_DRIVER=${OPENSHELL_E2E_DRIVER} conflicts with the ${label} e2e lane." >&2
+    echo "       Set OPENSHELL_E2E_DRIVER=${lane} or unset OPENSHELL_E2E_DRIVER." >&2
+    exit 2
+  fi
+
+  export CONTAINER_ENGINE="${lane}"
+  export OPENSHELL_E2E_DRIVER="${lane}"
+}
+
+require_container_engine_lane docker Docker
+CONTAINER_ENGINE_QUIET="${CONTAINER_ENGINE_QUIET:-1}"
+# shellcheck source=tasks/scripts/container-engine.sh
+source "${ROOT}/tasks/scripts/container-engine.sh"
 
 github_actions_host_docker_tmpdir() {
   if [ "${GITHUB_ACTIONS:-}" != "true" ] \
@@ -73,7 +114,13 @@ DOCKER_NETWORK_NAME=""
 DOCKER_NETWORK_CONNECTED_CONTAINER=""
 DOCKER_NETWORK_MANAGED=0
 GPU_MODE="${OPENSHELL_E2E_DOCKER_GPU:-0}"
-DOCKER_SUPERVISOR_ARGS=()
+OIDC_MODE="${OPENSHELL_E2E_OIDC_GATEWAY:-0}"
+OIDC_ISSUER="${OPENSHELL_E2E_OIDC_ISSUER:-}"
+
+if [ "${OIDC_MODE}" = "1" ] && [ -z "${OIDC_ISSUER}" ]; then
+  echo "ERROR: OPENSHELL_E2E_OIDC_ISSUER is required when OPENSHELL_E2E_OIDC_GATEWAY=1" >&2
+  exit 2
+fi
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -226,8 +273,7 @@ if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
     "$(e2e_endpoint_port "${OPENSHELL_GATEWAY_ENDPOINT}")"
   export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-180}"
-  export OPENSHELL_E2E_DRIVER="${OPENSHELL_E2E_DRIVER:-docker}"
-  export OPENSHELL_E2E_CONTAINER_ENGINE="${OPENSHELL_E2E_CONTAINER_ENGINE:-docker}"
+  export OPENSHELL_E2E_DRIVER="docker"
 
   echo "Using existing e2e gateway endpoint: ${OPENSHELL_GATEWAY_ENDPOINT}"
   "$@"
@@ -255,25 +301,6 @@ if [ "${GPU_MODE}" = "1" ]; then
   fi
 fi
 
-normalize_arch() {
-  case "$1" in
-    x86_64|amd64) echo "amd64" ;;
-    aarch64|arm64) echo "arm64" ;;
-    *) echo "$1" ;;
-  esac
-}
-
-linux_target_triple() {
-  case "$1" in
-    amd64) echo "x86_64-unknown-linux-gnu" ;;
-    arm64) echo "aarch64-unknown-linux-gnu" ;;
-    *)
-      echo "ERROR: unsupported Docker daemon architecture '$1'" >&2
-      exit 2
-      ;;
-  esac
-}
-
 resolve_docker_supervisor_image() {
   if [ -n "${OPENSHELL_DOCKER_SUPERVISOR_IMAGE:-}" ]; then
     printf '%s\n' "${OPENSHELL_DOCKER_SUPERVISOR_IMAGE}"
@@ -296,7 +323,7 @@ resolve_docker_supervisor_image() {
     return 0
   fi
 
-  printf '%s\n' ""
+  printf '%s\n' "openshell/supervisor:dev"
 }
 
 docker_pull_with_retry() {
@@ -325,6 +352,27 @@ docker_pull_with_retry() {
   return 1
 }
 
+build_local_docker_supervisor_image_if_required() {
+  local image=$1
+
+  if [ "${image}" != "openshell/supervisor:dev" ]; then
+    return 0
+  fi
+
+  local daemon_arch
+  daemon_arch="$(ce_info_arch)"
+
+  echo "Building local Docker supervisor image ${image} for linux/${daemon_arch}..."
+  CONTAINER_ENGINE=docker DOCKER_PLATFORM="linux/${daemon_arch}" IMAGE_TAG=dev \
+    bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor
+  if docker image inspect "${image}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "ERROR: expected supervisor image '${image}' after local build." >&2
+  exit 2
+}
+
 ensure_docker_supervisor_image() {
   local image=$1
 
@@ -342,62 +390,62 @@ ensure_docker_supervisor_image() {
   exit 2
 }
 
-DAEMON_ARCH="$(normalize_arch "$(docker info --format '{{.Architecture}}' 2>/dev/null || true)")"
-SUPERVISOR_TARGET="$(linux_target_triple "${DAEMON_ARCH}")"
-HOST_OS="$(uname -s)"
-HOST_ARCH="$(normalize_arch "$(uname -m)")"
-SUPERVISOR_OUT_DIR="${WORKDIR}/supervisor/${DAEMON_ARCH}"
-SUPERVISOR_BIN="${SUPERVISOR_OUT_DIR}/openshell-sandbox"
+image_uses_latest_tag() {
+  local image=$1
+  local last_component
 
-CARGO_BUILD_JOBS_ARG=()
-if [ -n "${CARGO_BUILD_JOBS:-}" ]; then
-  CARGO_BUILD_JOBS_ARG=(-j "${CARGO_BUILD_JOBS}")
-fi
+  # Digest references are immutable even if the tag portion says latest.
+  if [[ "${image}" == *@* ]]; then
+    return 1
+  fi
+
+  last_component="${image##*/}"
+  # Docker treats an omitted tag as :latest.
+  if [[ "${last_component}" != *:* ]]; then
+    return 0
+  fi
+
+  [[ "${last_component}" == *:latest ]]
+}
+
+ensure_sandbox_image_available() {
+  local image=$1
+
+  if image_uses_latest_tag "${image}"; then
+    echo "Refreshing latest sandbox image ${image}..."
+    docker_pull_with_retry "${image}"
+    return
+  fi
+
+  if docker image inspect "${image}" >/dev/null 2>&1; then
+    return
+  fi
+
+  echo "Pulling ${image}..."
+  docker_pull_with_retry "${image}"
+}
 
 e2e_build_gateway_binaries "${ROOT}" TARGET_DIR GATEWAY_BIN CLI_BIN
 
 SUPERVISOR_IMAGE="$(resolve_docker_supervisor_image)"
-if [ -n "${SUPERVISOR_IMAGE}" ]; then
-  ensure_docker_supervisor_image "${SUPERVISOR_IMAGE}"
-  echo "Using Docker supervisor image: ${SUPERVISOR_IMAGE}"
-  DOCKER_SUPERVISOR_ARGS=(--docker-supervisor-image "${SUPERVISOR_IMAGE}")
-else
-  echo "Building openshell-sandbox for ${SUPERVISOR_TARGET}..."
-  mkdir -p "${SUPERVISOR_OUT_DIR}"
-  if [ "${HOST_OS}" = "Linux" ] && [ "${HOST_ARCH}" = "${DAEMON_ARCH}" ]; then
-    rustup target add "${SUPERVISOR_TARGET}" >/dev/null 2>&1 || true
-    cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-      --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}"
-    cp "${TARGET_DIR}/${SUPERVISOR_TARGET}/release/openshell-sandbox" "${SUPERVISOR_BIN}"
-  else
-    CONTAINER_ENGINE=docker \
-    DOCKER_PLATFORM="linux/${DAEMON_ARCH}" \
-    DOCKER_OUTPUT="type=local,dest=${SUPERVISOR_OUT_DIR}" \
-      bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor-output
-  fi
-
-  if [ ! -f "${SUPERVISOR_BIN}" ]; then
-    echo "ERROR: expected supervisor binary at ${SUPERVISOR_BIN}" >&2
-    exit 1
-  fi
-  chmod +x "${SUPERVISOR_BIN}"
-  DOCKER_SUPERVISOR_ARGS=(--docker-supervisor-bin "${SUPERVISOR_BIN}")
-fi
+build_local_docker_supervisor_image_if_required "${SUPERVISOR_IMAGE}"
+ensure_docker_supervisor_image "${SUPERVISOR_IMAGE}"
+echo "Using Docker supervisor image: ${SUPERVISOR_IMAGE}"
 
 DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 SANDBOX_IMAGE="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
-if ! docker image inspect "${SANDBOX_IMAGE}" >/dev/null 2>&1; then
-  echo "Pulling ${SANDBOX_IMAGE}..."
-  if ! docker_pull_with_retry "${SANDBOX_IMAGE}"; then
-    echo "ERROR: sandbox image '${SANDBOX_IMAGE}' is not available." >&2
-    exit 2
-  fi
+SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY:-${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}}"
+if ! ensure_sandbox_image_available "${SANDBOX_IMAGE}"; then
+  echo "ERROR: sandbox image '${SANDBOX_IMAGE}' is not available." >&2
+  exit 2
 fi
 
 PKI_DIR="${WORKDIR}/pki"
 e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
+export OPENSHELL_E2E_GATEWAY_CA_CERT="${PKI_DIR}/ca.crt"
 
 HOST_PORT=$(e2e_pick_port)
+HEALTH_PORT=$(e2e_pick_port)
 STATE_DIR="${XDG_STATE_HOME}"
 mkdir -p "${STATE_DIR}"
 JWT_DIR="${STATE_DIR}/jwt"
@@ -412,7 +460,6 @@ export OPENSHELL_E2E_DOCKER_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
 export OPENSHELL_E2E_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
 export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
 export OPENSHELL_E2E_DRIVER="docker"
-export OPENSHELL_E2E_CONTAINER_ENGINE="docker"
 if connect_current_container_to_docker_network "${DOCKER_NETWORK_NAME}"; then
   echo "Connected CI job container to Docker network ${DOCKER_NETWORK_NAME} (${GATEWAY_HOST_ALIAS_IP})."
 else
@@ -420,6 +467,7 @@ else
 fi
 
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
+echo "Using sandbox image: ${SANDBOX_IMAGE} (pull policy: ${SANDBOX_IMAGE_PULL_POLICY})"
 e2e_generate_gateway_jwt "${JWT_DIR}"
 
 # Driver-specific options moved from CLI flags into a TOML config table
@@ -440,29 +488,23 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   printf '[openshell]\nversion = 1\n\n'
   printf '[openshell.gateway]\nlog_level = "info"\n\n'
   e2e_write_gateway_jwt_config "${JWT_DIR}" "openshell-e2e-docker-${HOST_PORT}"
-  e2e_write_gateway_mtls_auth_config
+  if [ "${OIDC_MODE}" != "1" ]; then
+    e2e_write_gateway_mtls_auth_config
+    if [ -n "${OPENSHELL_OIDC_ISSUER:-}" ]; then
+      e2e_write_gateway_oidc_config "${OPENSHELL_OIDC_ISSUER}"
+    fi
+  fi
   printf '[openshell.drivers.docker]\n'
   printf 'sandbox_namespace = %s\n'    "$(toml_string "${E2E_NAMESPACE}")"
   printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"
   printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
   printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
-  printf 'image_pull_policy = "IfNotPresent"\n'
+  printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
   printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
   printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client/tls.crt")"
   printf 'guest_tls_key = %s\n'        "$(toml_string "${PKI_DIR}/client/tls.key")"
-  # DOCKER_SUPERVISOR_ARGS holds either ("--docker-supervisor-bin" "<path>")
-  # or ("--docker-supervisor-image" "<image>"); both map to TOML keys on
-  # the docker driver config.
-  for ((i=0; i<${#DOCKER_SUPERVISOR_ARGS[@]}; i+=2)); do
-    case "${DOCKER_SUPERVISOR_ARGS[$i]}" in
-      --docker-supervisor-bin)
-        printf 'supervisor_bin = %s\n'   "$(toml_string "${DOCKER_SUPERVISOR_ARGS[$((i+1))]}")"
-        ;;
-      --docker-supervisor-image)
-        printf 'supervisor_image = %s\n' "$(toml_string "${DOCKER_SUPERVISOR_ARGS[$((i+1))]}")"
-        ;;
-    esac
-  done
+  printf 'enable_bind_mounts = true\n'
+  printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
   if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
     printf 'host_gateway_ip = %s\n'    "$(toml_string "${GATEWAY_HOST_ALIAS_IP}")"
   fi
@@ -470,14 +512,25 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 
 GATEWAY_ARGS=(
   --config "${GATEWAY_CONFIG}"
-  --bind-address 0.0.0.0
   --port "${HOST_PORT}"
+  --health-port "${HEALTH_PORT}"
   --drivers docker
   --tls-cert "${PKI_DIR}/server/tls.crt"
   --tls-key "${PKI_DIR}/server/tls.key"
-  --tls-client-ca "${PKI_DIR}/ca.crt"
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"
 )
+
+if [ "${OIDC_MODE}" = "1" ]; then
+  GATEWAY_ARGS+=(
+    --oidc-issuer "${OIDC_ISSUER}"
+    --oidc-audience openshell-cli
+    --oidc-scopes-claim scope
+  )
+else
+  GATEWAY_ARGS+=(
+    --tls-client-ca "${PKI_DIR}/ca.crt"
+  )
+fi
 
 e2e_write_gateway_args_file "${GATEWAY_ARGS_FILE}" "${GATEWAY_ARGS[@]}"
 e2e_export_gateway_restart_metadata \
@@ -492,26 +545,35 @@ printf '%s\n' "${GATEWAY_PID}" >"${GATEWAY_PID_FILE}"
 
 GATEWAY_NAME="openshell-e2e-docker-${HOST_PORT}"
 CLI_GATEWAY_ENDPOINT="https://127.0.0.1:${HOST_PORT}"
-e2e_register_mtls_gateway \
-  "${XDG_CONFIG_HOME}" \
-  "${GATEWAY_NAME}" \
-  "${CLI_GATEWAY_ENDPOINT}" \
-  "${HOST_PORT}" \
-  "${PKI_DIR}"
+if [ "${OIDC_MODE}" = "1" ]; then
+  export OPENSHELL_E2E_OIDC_GATEWAY_ENDPOINT="${CLI_GATEWAY_ENDPOINT}"
+else
+  e2e_register_mtls_gateway \
+    "${XDG_CONFIG_HOME}" \
+    "${GATEWAY_NAME}" \
+    "${CLI_GATEWAY_ENDPOINT}" \
+    "${HOST_PORT}" \
+    "${PKI_DIR}" \
+    "${OPENSHELL_OIDC_ISSUER:-}"
+fi
 
 export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
 export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-180}"
 
+if [ "${OIDC_MODE}" = "1" ] || [ -n "${OPENSHELL_OIDC_ISSUER:-}" ]; then
+  export OPENSHELL_E2E_OIDC=1
+  export OPENSHELL_E2E_OIDC_SCOPES=1
+fi
+
 echo "Waiting for gateway to become healthy..."
 elapsed=0
 timeout=120
-last_status_output=""
 while [ "${elapsed}" -lt "${timeout}" ]; do
   if ! kill -0 "${GATEWAY_PID}" 2>/dev/null; then
     echo "ERROR: openshell-gateway exited before becoming healthy"
     exit 1
   fi
-  if last_status_output="$("${CLI_BIN}" status 2>&1)"; then
+  if curl -sf "http://127.0.0.1:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
     echo "Gateway healthy after ${elapsed}s."
     break
   fi
@@ -520,13 +582,6 @@ while [ "${elapsed}" -lt "${timeout}" ]; do
 done
 if [ "${elapsed}" -ge "${timeout}" ]; then
   echo "ERROR: gateway did not become healthy within ${timeout}s"
-  echo "=== last openshell status output ==="
-  if [ -n "${last_status_output}" ]; then
-    printf '%s\n' "${last_status_output}"
-  else
-    echo "<no output>"
-  fi
-  echo "=== end openshell status output ==="
   exit 1
 fi
 

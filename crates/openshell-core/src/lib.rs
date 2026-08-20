@@ -9,30 +9,50 @@
 //! - Common error types
 //! - Build version metadata
 
+pub mod activity;
 pub mod auth;
 pub mod config;
+pub mod container_paths;
+pub mod denial;
+pub mod driver_mounts;
 pub mod driver_utils;
+pub mod endpoint_path;
 pub mod error;
 pub mod forward;
+pub mod google_cloud;
 pub mod gpu;
+pub mod grpc_client;
+pub mod host_pattern;
 pub mod image;
 pub mod inference;
+pub mod jwt;
 pub mod metadata;
+pub mod middleware;
 pub mod net;
 pub mod paths;
+pub mod policy;
 pub mod progress;
+pub mod proposals;
 pub mod proto;
+pub mod proto_struct;
+pub mod provider_credentials;
 pub mod sandbox_env;
+pub mod secrets;
 pub mod settings;
 pub mod telemetry;
 pub mod time;
+pub mod transport_errors;
 
 pub use config::{
-    ComputeDriverKind, Config, GatewayAuthConfig, GatewayJwtConfig, MtlsAuthConfig, OidcConfig,
-    TlsConfig,
+    ComputeDriverKind, Config, GatewayAuthConfig, GatewayInterceptorBindingOverride,
+    GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
+    GatewayInterceptorPhaseConfig, GatewayJwtConfig, GatewayProviderProfileSourceConfig,
+    MtlsAuthConfig, OidcConfig, PolicyValidationFailureMode, TlsConfig,
 };
 pub use error::{ComputeDriverError, Error, Result};
-pub use metadata::{GetResourceVersion, ObjectId, ObjectLabels, ObjectName, SetResourceVersion};
+pub use metadata::{
+    GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace, SetResourceVersion,
+};
 
 /// Build version string derived from git metadata.
 ///

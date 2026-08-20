@@ -48,6 +48,13 @@ struct TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn get_current_user(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetCurrentUserRequest>,
+    ) -> Result<Response<openshell_core::proto::GetCurrentUserResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn health(
         &self,
         _request: tonic::Request<HealthRequest>,
@@ -58,11 +65,32 @@ impl OpenShell for TestOpenShell {
         }))
     }
 
+    async fn get_gateway_info(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetGatewayInfoRequest>,
+    ) -> Result<Response<openshell_core::proto::GetGatewayInfoResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn create_sandbox(
         &self,
         _request: tonic::Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         Ok(Response::new(SandboxResponse::default()))
+    }
+
+    async fn stop_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::StopSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn start_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::StartSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn get_sandbox(
@@ -79,6 +107,9 @@ impl OpenShell for TestOpenShell {
                     created_at_ms: 0,
                     labels: std::collections::HashMap::new(),
                     resource_version: 0,
+                    annotations: std::collections::HashMap::new(),
+                    workspace: String::new(),
+                    deletion_timestamp_ms: 0,
                 }),
                 ..Default::default()
             }),
@@ -132,21 +163,39 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(GetSandboxConfigResponse {
             policy: Some(SandboxPolicy {
                 version: 9,
-                network_policies: std::iter::once((
-                    "_provider_api".to_string(),
-                    NetworkPolicyRule {
-                        name: "_provider_api".to_string(),
-                        endpoints: vec![NetworkEndpoint {
-                            host: "api.provider.example.com".to_string(),
-                            port: 443,
-                            protocol: "rest".to_string(),
-                            enforcement: "enforce".to_string(),
-                            access: "read-only".to_string(),
+                network_policies: [
+                    (
+                        "user_api".to_string(),
+                        NetworkPolicyRule {
+                            name: "user_api".to_string(),
+                            endpoints: vec![NetworkEndpoint {
+                                host: "api.user.example.com".to_string(),
+                                port: 443,
+                                protocol: "rest".to_string(),
+                                enforcement: "enforce".to_string(),
+                                access: "read-only".to_string(),
+                                ..Default::default()
+                            }],
                             ..Default::default()
-                        }],
-                        ..Default::default()
-                    },
-                ))
+                        },
+                    ),
+                    (
+                        "_provider_api".to_string(),
+                        NetworkPolicyRule {
+                            name: "_provider_api".to_string(),
+                            endpoints: vec![NetworkEndpoint {
+                                host: "api.provider.example.com".to_string(),
+                                port: 443,
+                                protocol: "rest".to_string(),
+                                enforcement: "enforce".to_string(),
+                                access: "read-only".to_string(),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                    ),
+                ]
+                .into_iter()
                 .collect(),
                 ..Default::default()
             }),
@@ -259,6 +308,13 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ImportProviderProfilesRequest>,
     ) -> Result<Response<openshell_core::proto::ImportProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn update_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::UpdateProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::UpdateProviderProfilesResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 
@@ -536,6 +592,55 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<Self::ForwardTcpStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
+
+    async fn create_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CreateWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::CreateWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::GetWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspaces(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListWorkspacesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspacesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn add_workspace_member(
+        &self,
+        _request: tonic::Request<openshell_core::proto::AddWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::AddWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn remove_workspace_member(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RemoveWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::RemoveWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspace_members(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListWorkspaceMembersRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspaceMembersResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
 }
 
 struct TestServer {
@@ -603,9 +708,16 @@ async fn run_server() -> TestServer {
 async fn sandbox_get_sends_correct_name() {
     let ts = run_server().await;
 
-    run::sandbox_get(&ts.endpoint, "my-sandbox", false, &ts.tls)
-        .await
-        .expect("sandbox_get should succeed");
+    run::sandbox_get(
+        &ts.endpoint,
+        "my-sandbox",
+        false,
+        "table",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox_get should succeed");
 
     let recorded = ts.openshell.state.last_get_name.lock().await.clone();
     assert_eq!(
@@ -620,9 +732,16 @@ async fn sandbox_get_sends_correct_name() {
 async fn sandbox_get_policy_only_round_trip() {
     let ts = run_server().await;
 
-    run::sandbox_get(&ts.endpoint, "my-sandbox", true, &ts.tls)
-        .await
-        .expect("sandbox_get with policy_only should succeed");
+    run::sandbox_get(
+        &ts.endpoint,
+        "my-sandbox",
+        true,
+        "table",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox_get with policy_only should succeed");
 
     let recorded = ts.openshell.state.last_get_name.lock().await.clone();
     assert_eq!(recorded.as_deref(), Some("my-sandbox"));
@@ -637,16 +756,16 @@ async fn sandbox_get_with_persisted_last_sandbox() {
     let _guard = EnvVarGuard::set(&[("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap())]);
 
     // Persist a last-used sandbox for "integration-cluster".
-    save_last_sandbox("integration-cluster", "persisted-sb")
+    save_last_sandbox("integration-cluster", "default", "persisted-sb")
         .expect("save_last_sandbox should succeed");
 
     // Resolve the name (simulates what the CLI does in main.rs).
-    let resolved = load_last_sandbox("integration-cluster")
+    let resolved = load_last_sandbox("integration-cluster", "default")
         .expect("load_last_sandbox should return the saved name");
     assert_eq!(resolved, "persisted-sb");
 
     // Call sandbox_get with the resolved name.
-    run::sandbox_get(&ts.endpoint, &resolved, false, &ts.tls)
+    run::sandbox_get(&ts.endpoint, &resolved, false, "table", "default", &ts.tls)
         .await
         .expect("sandbox_get should succeed");
 
@@ -668,8 +787,9 @@ async fn policy_get_full_json_cli_prints_policy_payload() {
         &ts.endpoint,
         "my-sandbox",
         0,
-        true,
+        run::PolicyGetView::Full,
         "json",
+        "default",
         &ts.tls,
         (&mut stdout, &mut stderr),
     )
@@ -700,6 +820,52 @@ async fn policy_get_full_json_cli_prints_policy_payload() {
         json["policy"]["network_policies"]["_provider_api"]["endpoints"][0]["host"],
         "api.provider.example.com"
     );
+    assert_eq!(
+        json["policy"]["network_policies"]["user_api"]["endpoints"][0]["host"],
+        "api.user.example.com"
+    );
+}
+
+#[tokio::test]
+async fn policy_get_base_json_cli_prints_round_trippable_policy_payload() {
+    let ts = run_server().await;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    run::sandbox_policy_get_to_writer(
+        &ts.endpoint,
+        "my-sandbox",
+        0,
+        run::PolicyGetView::Base,
+        "json",
+        "default",
+        &ts.tls,
+        (&mut stdout, &mut stderr),
+    )
+    .await
+    .expect("policy get --base should succeed");
+
+    assert!(
+        stderr.is_empty(),
+        "policy get --base should not print stderr: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&stdout).expect("stdout should be valid JSON");
+    assert_eq!(json["scope"], "sandbox");
+    assert_eq!(json["sandbox"], "my-sandbox");
+    assert_eq!(json["status"], "effective");
+    assert!(
+        json["policy"]["network_policies"]
+            .get("_provider_api")
+            .is_none(),
+        "base policy output must omit provider-composed policy entries"
+    );
+    assert_eq!(
+        json["policy"]["network_policies"]["user_api"]["endpoints"][0]["host"],
+        "api.user.example.com"
+    );
 }
 
 #[tokio::test]
@@ -712,8 +878,9 @@ async fn policy_get_explicit_revision_uses_stored_policy_status() {
         &ts.endpoint,
         "my-sandbox",
         3,
-        true,
+        run::PolicyGetView::Full,
         "json",
+        "default",
         &ts.tls,
         (&mut stdout, &mut stderr),
     )
@@ -749,11 +916,18 @@ async fn explicit_name_takes_precedence_over_persisted() {
     let _guard = EnvVarGuard::set(&[("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap())]);
 
     // Persist one name, but supply a different one explicitly.
-    save_last_sandbox("my-cluster", "old-sandbox").expect("save should succeed");
+    save_last_sandbox("my-cluster", "default", "old-sandbox").expect("save should succeed");
 
-    run::sandbox_get(&ts.endpoint, "explicit-sandbox", false, &ts.tls)
-        .await
-        .expect("sandbox_get should succeed");
+    run::sandbox_get(
+        &ts.endpoint,
+        "explicit-sandbox",
+        false,
+        "table",
+        "default",
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox_get should succeed");
 
     let recorded = ts.openshell.state.last_get_name.lock().await.clone();
     assert_eq!(

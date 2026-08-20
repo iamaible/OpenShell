@@ -2,23 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Anonymous sandbox network activity counter aggregation.
+//!
+//! Producer-side types (`ActivityEvent`, `ActivitySender`,
+//! `ACTIVITY_EVENT_QUEUE_CAPACITY`, `try_record_activity`) live in
+//! `openshell_core::activity` so the supervisor leaves can emit without
+//! depending on the orchestrator. This module hosts the aggregator that
+//! runs orchestrator-side and flushes summaries to the gateway.
 
 use std::collections::HashMap;
 use std::future::Future;
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, warn};
 
-pub const ACTIVITY_EVENT_QUEUE_CAPACITY: usize = 1024;
+pub use openshell_core::activity::ActivityEvent;
+
 const ACTIVITY_FLUSH_QUEUE_CAPACITY: usize = 1;
 pub const DEFAULT_ACTIVITY_FLUSH_INTERVAL_SECS: u64 = 10;
-
-#[derive(Debug, Clone)]
-pub struct ActivityEvent {
-    pub denied: bool,
-    pub deny_group: &'static str,
-}
-
-pub type ActivitySender = mpsc::Sender<ActivityEvent>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlushableActivitySummary {
@@ -46,10 +45,13 @@ impl ActivityAggregator {
         }
     }
 
-    pub async fn run<F, Fut>(mut self, flush_callback: F)
+    /// `ready_gate` is checked before each flush. When it returns `false`,
+    /// the drain is skipped and events stay in the buffer until the next tick.
+    pub async fn run<F, Fut, G>(mut self, flush_callback: F, ready_gate: G)
     where
         F: Fn(FlushableActivitySummary) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
+        G: Fn() -> bool,
     {
         let (flush_tx, mut flush_rx) =
             mpsc::channel::<FlushableActivitySummary>(ACTIVITY_FLUSH_QUEUE_CAPACITY);
@@ -69,15 +71,26 @@ impl ActivityAggregator {
                     if let Some(event) = event {
                         self.ingest(event);
                     } else {
-                        if let Some(summary) = self.drain() {
-                            queue_flush_summary(&flush_tx, summary);
+                        if self.network_activity_count > 0 {
+                            if ready_gate() {
+                                if let Some(summary) = self.drain() {
+                                    queue_flush_summary(&flush_tx, summary);
+                                }
+                            } else {
+                                warn!(
+                                    count = self.network_activity_count,
+                                    "ActivityAggregator: dropping unflushed events, workspace not yet known"
+                                );
+                            }
                         }
                         debug!("ActivityAggregator: channel closed, exiting");
                         return;
                     }
                 }
                 _ = flush_interval.tick() => {
-                    if let Some(summary) = self.drain() {
+                    if ready_gate()
+                        && let Some(summary) = self.drain()
+                    {
                         debug!(
                             count = summary.network_activity_count,
                             denied = summary.denied_action_count,
@@ -115,10 +128,6 @@ impl ActivityAggregator {
         self.denied_action_count = 0;
         Some(summary)
     }
-}
-
-pub fn try_record_activity(tx: &ActivitySender, denied: bool, deny_group: &'static str) -> bool {
-    tx.try_send(ActivityEvent { denied, deny_group }).is_ok()
 }
 
 pub fn activity_flush_interval_secs_from_env(value: Option<&str>) -> u64 {
@@ -181,14 +190,6 @@ mod tests {
         assert_float_eq(denial_rate_pct(0, 10), 0.0);
         assert_float_eq(denial_rate_pct(4, 1), 25.0);
         assert_float_eq(denial_rate_pct(4, 10), 100.0);
-    }
-
-    #[test]
-    fn activity_send_drops_when_queue_is_full() {
-        let (tx, _rx) = mpsc::channel(1);
-
-        assert!(try_record_activity(&tx, false, "unknown"));
-        assert!(!try_record_activity(&tx, true, "connect_policy"));
     }
 
     #[test]

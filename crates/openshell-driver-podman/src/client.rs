@@ -162,6 +162,23 @@ pub struct ContainerConfig {
     pub labels: HashMap<String, String>,
 }
 
+/// Immutable image metadata needed to bind OCI identity inspection to launch.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ImageInspect {
+    #[serde(alias = "ID")]
+    pub id: String,
+    #[serde(default)]
+    pub config: Option<ImageConfig>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ImageConfig {
+    #[serde(default)]
+    pub user: String,
+}
+
 /// A container summary returned by the list API.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -194,6 +211,16 @@ pub struct PortMappingEntry {
     #[serde(default)]
     #[allow(dead_code)] // kept for podman API compat
     pub host_ip: String,
+}
+
+/// A named Podman volume returned by the libpod inspect API.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct VolumeInspect {
+    #[serde(default)]
+    pub driver: String,
+    #[serde(default)]
+    pub options: HashMap<String, String>,
 }
 
 /// A Podman event from the events stream.
@@ -234,6 +261,8 @@ pub struct HostInfo {
     pub cgroup_version: String,
     #[serde(default)]
     pub network_backend: String,
+    #[serde(default)]
+    pub rootless_network_cmd: String,
     #[serde(default)]
     pub security: SecurityInfo,
 }
@@ -381,6 +410,23 @@ impl PodmanClient {
         }
     }
 
+    /// Perform a versioned HTTP request with a raw byte body (not JSON).
+    async fn request_raw(
+        &self,
+        method: hyper::Method,
+        path: &str,
+        content_type: &str,
+        body: Bytes,
+    ) -> Result<(hyper::StatusCode, Bytes), PodmanApiError> {
+        let req = Self::build_request(
+            method,
+            &format!("/{API_VERSION}{path}"),
+            Full::new(body),
+            Some(content_type),
+        );
+        self.send_request(req, API_TIMEOUT).await
+    }
+
     /// POST a JSON body and ignore 409 Conflict (resource already exists).
     async fn create_ignore_conflict(&self, path: &str, body: &Value) -> Result<(), PodmanApiError> {
         match self
@@ -435,15 +481,62 @@ impl PodmanClient {
         }
     }
 
-    /// Force-remove a container and its anonymous volumes.
-    pub async fn remove_container(&self, name: &str) -> Result<(), PodmanApiError> {
+    /// Remove a container in one timed, forced Libpod delete operation.
+    ///
+    /// The Libpod endpoint uses `volumes` for anonymous-volume removal. Its
+    /// Docker-compatible counterpart uses the shorter `v` parameter.
+    pub async fn remove_container(
+        &self,
+        name: &str,
+        timeout_secs: u32,
+    ) -> Result<(), PodmanApiError> {
         validate_name(name)?;
-        self.request_ok(
-            hyper::Method::DELETE,
-            &format!("/libpod/containers/{name}?force=true&v=true"),
-            None,
-        )
-        .await
+        // The delete request covers both the graceful stop and the subsequent
+        // storage, network, and anonymous-volume cleanup. Preserve the normal
+        // API timeout as cleanup headroom after the stop grace period.
+        let http_timeout = Duration::from_secs(u64::from(timeout_secs)) + API_TIMEOUT;
+        let (status, bytes) = self
+            .request(
+                hyper::Method::DELETE,
+                &format!(
+                    "/libpod/containers/{name}?force=true&volumes=true&timeout={timeout_secs}"
+                ),
+                None,
+                http_timeout,
+            )
+            .await?;
+        let code = status.as_u16();
+        if status.is_success() || code == 304 {
+            Ok(())
+        } else {
+            Err(error_from_response(code, &bytes))
+        }
+    }
+
+    /// Download a file from a container as a tar archive.
+    ///
+    /// Calls `GET /libpod/containers/{name}/archive?path={path}` and returns
+    /// the raw tar bytes. The container does not need to be running.
+    pub async fn copy_from_container(
+        &self,
+        name: &str,
+        path: &str,
+    ) -> Result<Bytes, PodmanApiError> {
+        validate_name(name)?;
+        let encoded_path = url_encode(path);
+        let (status, bytes) = self
+            .request(
+                hyper::Method::GET,
+                &format!("/libpod/containers/{name}/archive?path={encoded_path}"),
+                None,
+                API_TIMEOUT,
+            )
+            .await?;
+        if status.is_success() {
+            Ok(bytes)
+        } else {
+            Err(error_from_response(status.as_u16(), &bytes))
+        }
     }
 
     /// Inspect a container by name or ID.
@@ -457,12 +550,12 @@ impl PodmanClient {
         .await
     }
 
-    /// List containers matching a label filter (e.g. `"openshell.managed=true"`).
+    /// List containers matching label filters (e.g. `&["openshell.managed=true"]`).
     pub async fn list_containers(
         &self,
-        label_filter: &str,
+        label_filters: &[&str],
     ) -> Result<Vec<ContainerListEntry>, PodmanApiError> {
-        let filters = serde_json::json!({"label": [label_filter]});
+        let filters = serde_json::json!({"label": label_filters});
         let encoded = url_encode(&filters.to_string());
         self.request_json(
             hyper::Method::GET,
@@ -488,6 +581,74 @@ impl PodmanClient {
             .request_ok(
                 hyper::Method::DELETE,
                 &format!("/libpod/volumes/{name}"),
+                None,
+            )
+            .await
+        {
+            Ok(()) | Err(PodmanApiError::NotFound(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Inspect a named volume. Does not create the volume.
+    pub async fn inspect_volume(&self, name: &str) -> Result<VolumeInspect, PodmanApiError> {
+        validate_name(name)?;
+        self.request_json(
+            hyper::Method::GET,
+            &format!("/libpod/volumes/{name}/json"),
+            None,
+        )
+        .await
+    }
+
+    // ── Secret operations ────────────────────────────────────────────────
+
+    /// Create a Podman secret with the given name and raw value.
+    ///
+    /// Idempotent: if a secret with the same name already exists it is
+    /// replaced (delete + recreate) so the value is always up-to-date.
+    pub async fn create_secret(&self, name: &str, value: &[u8]) -> Result<(), PodmanApiError> {
+        validate_name(name)?;
+        let encoded_name = url_encode(name);
+        let path = format!("/libpod/secrets/create?name={encoded_name}");
+        let (status, bytes) = self
+            .request_raw(
+                hyper::Method::POST,
+                &path,
+                "application/octet-stream",
+                Bytes::copy_from_slice(value),
+            )
+            .await?;
+
+        match status.as_u16() {
+            200 | 201 => Ok(()),
+            409 => {
+                self.remove_secret(name).await?;
+                let (status2, bytes2) = self
+                    .request_raw(
+                        hyper::Method::POST,
+                        &path,
+                        "application/octet-stream",
+                        Bytes::copy_from_slice(value),
+                    )
+                    .await?;
+                if status2.is_success() {
+                    Ok(())
+                } else {
+                    Err(error_from_response(status2.as_u16(), &bytes2))
+                }
+            }
+            _ => Err(error_from_response(status.as_u16(), &bytes)),
+        }
+    }
+
+    /// Remove a Podman secret by name. Idempotent (not-found is ignored).
+    pub async fn remove_secret(&self, name: &str) -> Result<(), PodmanApiError> {
+        validate_name(name)?;
+        match self
+            .request_ok(
+                hyper::Method::DELETE,
+                &format!("/libpod/secrets/{name}"),
                 None,
             )
             .await
@@ -578,6 +739,16 @@ impl PodmanClient {
             });
         }
         Ok(())
+    }
+
+    /// Inspect a locally selected image for immutable ID and OCI config.
+    pub async fn inspect_image(&self, reference: &str) -> Result<ImageInspect, PodmanApiError> {
+        self.request_json(
+            hyper::Method::GET,
+            &format!("/libpod/images/{}/json", url_encode(reference)),
+            None,
+        )
+        .await
     }
 
     // ── System operations ────────────────────────────────────────────────
@@ -738,6 +909,8 @@ fn url_encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::{StubResponse, spawn_podman_stub};
+    use hyper::StatusCode;
 
     #[test]
     fn url_encode_encodes_special_characters() {
@@ -776,5 +949,136 @@ mod tests {
         // Exactly at the limit should be accepted.
         let exact_name = "a".repeat(MAX_NAME_LEN);
         assert!(validate_name(&exact_name).is_ok());
+    }
+
+    #[test]
+    fn system_info_parses_rootless_network_helper() {
+        let info: SystemInfo = serde_json::from_str(
+            r#"{
+                "host": {
+                    "cgroupVersion": "v2",
+                    "networkBackend": "netavark",
+                    "rootlessNetworkCmd": "pasta",
+                    "security": {"rootless": true}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(info.host.security.rootless);
+        assert_eq!(info.host.rootless_network_cmd, "pasta");
+    }
+
+    #[tokio::test]
+    async fn inspect_volume_parses_driver_options() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "inspect-volume",
+            vec![StubResponse::new(
+                StatusCode::OK,
+                r#"{"Name":"work-bind","Driver":"local","Options":{"type":"none","o":"rw,bind","device":"/srv/work"}}"#,
+            )],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        let volume = client
+            .inspect_volume("work-bind")
+            .await
+            .expect("volume inspect should parse");
+
+        assert_eq!(volume.driver, "local");
+        assert_eq!(volume.options.get("o").map(String::as_str), Some("rw,bind"));
+        handle.await.expect("stub task should finish");
+        assert_eq!(
+            request_log
+                .lock()
+                .expect("request log lock should not be poisoned")
+                .as_slice(),
+            ["GET /v5.0.0/libpod/volumes/work-bind/json"]
+        );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn inspect_image_reads_immutable_id_and_oci_user() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "inspect-image",
+            vec![StubResponse::new(
+                StatusCode::OK,
+                r#"{"Id":"sha256:immutable","Config":{"User":"app:staff"}}"#,
+            )],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        let image = client
+            .inspect_image("example/image:latest")
+            .await
+            .expect("image inspect should parse");
+
+        assert_eq!(image.id, "sha256:immutable");
+        assert_eq!(
+            image.config.as_ref().map(|config| config.user.as_str()),
+            Some("app:staff")
+        );
+        handle.await.expect("stub task should finish");
+        assert_eq!(
+            request_log
+                .lock()
+                .expect("request log lock should not be poisoned")
+                .as_slice(),
+            ["GET /v5.0.0/libpod/images/example%2Fimage%3Alatest/json"]
+        );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn remove_container_uses_single_timed_libpod_removal() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "remove-container",
+            vec![StubResponse::new(StatusCode::NO_CONTENT, "")],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        client
+            .remove_container("sandbox-123", 10)
+            .await
+            .expect("container removal should succeed");
+
+        handle.await.expect("stub task should finish");
+        assert_eq!(
+            request_log
+                .lock()
+                .expect("request log lock should not be poisoned")
+                .as_slice(),
+            ["DELETE /v5.0.0/libpod/containers/sandbox-123?force=true&volumes=true&timeout=10"]
+        );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remove_container_allows_cleanup_after_stop_timeout() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "remove-container-delayed",
+            vec![StubResponse::new(StatusCode::NO_CONTENT, "").with_delay(Duration::from_secs(6))],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        let removal = tokio::spawn(async move { client.remove_container("sandbox-123", 0).await });
+        while request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .is_empty()
+        {
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+
+        removal
+            .await
+            .expect("removal task should finish")
+            .expect("container removal should retain the API timeout for cleanup");
+
+        handle.await.expect("stub task should finish");
+        let _ = std::fs::remove_file(socket_path);
     }
 }

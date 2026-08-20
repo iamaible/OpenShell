@@ -14,9 +14,10 @@ const SUPERVISOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-sa
 const UMOCI: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/umoci.zst"));
 const ROOTFS_VARIANT_MARKER: &str = ".openshell-rootfs-variant";
 const SANDBOX_GUEST_INIT_PATH: &str = "/srv/openshell-vm-sandbox-init.sh";
-const SANDBOX_SUPERVISOR_PATH: &str = "/opt/openshell/bin/openshell-sandbox";
-const SANDBOX_UMOCI_PATH: &str = "/opt/openshell/bin/umoci";
-const SANDBOX_OWNER_NORMALIZED_MARKER: &str = "/opt/openshell/.sandbox-owner-normalized";
+const SANDBOX_SUPERVISOR_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
+const SANDBOX_UMOCI_PATH: &str = openshell_core::container_paths::VM_UMOCI_PATH;
+const SANDBOX_OWNER_NORMALIZED_MARKER: &str =
+    openshell_core::container_paths::VM_SANDBOX_OWNER_NORMALIZED_MARKER;
 const ROOTFS_IMAGE_MIN_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 const ROOTFS_IMAGE_MIN_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
 const EXT4_IMAGE_MIN_HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
@@ -26,11 +27,14 @@ pub const fn sandbox_guest_init_path() -> &'static str {
     SANDBOX_GUEST_INIT_PATH
 }
 
+#[allow(clippy::similar_names)]
 pub fn prepare_sandbox_rootfs_from_image_root(
     rootfs: &Path,
     image_identity: &str,
+    sandbox_uid: u32,
+    sandbox_gid: u32,
 ) -> Result<(), String> {
-    prepare_sandbox_rootfs(rootfs)?;
+    prepare_sandbox_rootfs(rootfs, sandbox_uid, sandbox_gid)?;
     validate_sandbox_rootfs(rootfs)?;
     fs::write(
         rootfs.join(ROOTFS_VARIANT_MARKER),
@@ -348,7 +352,8 @@ fn append_symlink_to_archive(
         .map_err(|e| format!("append symlink {}: {e}", source_path.display()))
 }
 
-fn prepare_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
+#[allow(clippy::similar_names)]
+fn prepare_sandbox_rootfs(rootfs: &Path, sandbox_uid: u32, sandbox_gid: u32) -> Result<(), String> {
     for relative in ["opt/openshell/.initialized", "opt/openshell/.rootfs-type"] {
         remove_rootfs_path(rootfs, relative)?;
     }
@@ -377,7 +382,7 @@ fn prepare_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
     fs::create_dir_all(&opt_dir).map_err(|e| format!("create {}: {e}", opt_dir.display()))?;
     fs::write(opt_dir.join(".rootfs-type"), "sandbox\n")
         .map_err(|e| format!("write sandbox rootfs marker: {e}"))?;
-    ensure_sandbox_guest_user(rootfs)?;
+    ensure_sandbox_guest_user(rootfs, sandbox_uid, sandbox_gid)?;
     create_sandbox_mountpoint(&rootfs.join("sandbox"))?;
     create_sandbox_mountpoint(&rootfs.join("image-cache"))?;
     create_sandbox_mountpoint(&rootfs.join("lower"))?;
@@ -457,12 +462,19 @@ fn round_up_to_mib(bytes: u64) -> u64 {
     bytes.div_ceil(MIB) * MIB
 }
 
+enum FormatterAttempt {
+    Succeeded,
+    Failed(String),
+    Unavailable(String),
+}
+
 fn format_ext4_image_from_dir(source: &Path, image_path: &Path) -> Result<(), String> {
-    let mut last_error = None;
-    for tool in ["mke2fs", "mkfs.ext4"] {
-        for candidate in e2fs_tool_candidates(tool) {
+    let candidates = ["mke2fs", "mkfs.ext4"]
+        .into_iter()
+        .flat_map(e2fs_tool_candidates);
+    run_ext4_formatter_candidates(candidates, |candidate| {
             let label = candidate.display().to_string();
-            let output = Command::new(&candidate)
+            let output = Command::new(candidate)
                 .arg("-q")
                 .arg("-F")
                 .arg("-t")
@@ -474,29 +486,51 @@ fn format_ext4_image_from_dir(source: &Path, image_path: &Path) -> Result<(), St
                 .arg(image_path)
                 .output();
             match output {
-                Ok(output) if output.status.success() => return Ok(()),
-                Ok(output) => {
-                    last_error = Some(format!(
+                Ok(output) if output.status.success() => FormatterAttempt::Succeeded,
+                Ok(output) => FormatterAttempt::Failed(format!(
                         "{label} failed with status {}\nstdout: {}\nstderr: {}",
                         output.status,
                         String::from_utf8_lossy(&output.stdout),
                         String::from_utf8_lossy(&output.stderr)
-                    ));
-                }
+                    )),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    last_error = Some(format!("{label} not found"));
+                    FormatterAttempt::Unavailable(format!("{label} not found"))
                 }
-                Err(err) => {
-                    last_error = Some(format!("run {label}: {err}"));
-                }
+                Err(err) => FormatterAttempt::Failed(format!("run {label}: {err}")),
             }
+        })
+        .map_err(|details| {
+            format!(
+                "failed to create ext4 rootfs image from {}: {details}. Install e2fsprogs (mke2fs/mkfs.ext4) and retry",
+                source.display()
+            )
+        })
+}
+
+fn run_ext4_formatter_candidates(
+    candidates: impl IntoIterator<Item = PathBuf>,
+    mut run: impl FnMut(&Path) -> FormatterAttempt,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    let mut unavailable = Vec::new();
+
+    for candidate in candidates {
+        match run(&candidate) {
+            FormatterAttempt::Succeeded => return Ok(()),
+            FormatterAttempt::Failed(error) => failures.push(error),
+            FormatterAttempt::Unavailable(error) => unavailable.push(error),
         }
     }
-    Err(format!(
-        "failed to create ext4 rootfs image from {}: {}. Install e2fsprogs (mke2fs/mkfs.ext4) and retry",
-        source.display(),
-        last_error.unwrap_or_else(|| "no ext4 formatter found".to_string())
-    ))
+
+    if failures.is_empty() {
+        Err(if unavailable.is_empty() {
+            "no ext4 formatter candidates configured".to_string()
+        } else {
+            unavailable.join("\n")
+        })
+    } else {
+        Err(failures.join("\n"))
+    }
 }
 
 fn ensure_rootfs_image_parent_dirs(image_path: &Path, guest_path: &str) {
@@ -752,16 +786,18 @@ fn temporary_injection_path(image_path: &Path) -> PathBuf {
     ))
 }
 
-fn ensure_sandbox_guest_user(rootfs: &Path) -> Result<(), String> {
-    const SANDBOX_UID: u32 = 10001;
-    const SANDBOX_GID: u32 = 10001;
-
+#[allow(clippy::similar_names)]
+fn ensure_sandbox_guest_user(
+    rootfs: &Path,
+    sandbox_uid: u32,
+    sandbox_gid: u32,
+) -> Result<(), String> {
     let etc_dir = rootfs.join("etc");
     fs::create_dir_all(&etc_dir).map_err(|e| format!("create {}: {e}", etc_dir.display()))?;
 
     ensure_line_in_file(
         &etc_dir.join("group"),
-        &format!("sandbox:x:{SANDBOX_GID}:"),
+        &format!("sandbox:x:{sandbox_gid}:"),
         |line| line.starts_with("sandbox:"),
     )?;
     ensure_line_in_file(&etc_dir.join("gshadow"), "sandbox:!::", |line| {
@@ -769,7 +805,7 @@ fn ensure_sandbox_guest_user(rootfs: &Path) -> Result<(), String> {
     })?;
     ensure_line_in_file(
         &etc_dir.join("passwd"),
-        &format!("sandbox:x:{SANDBOX_UID}:{SANDBOX_GID}:OpenShell Sandbox:/sandbox:/bin/bash"),
+        &format!("sandbox:x:{sandbox_uid}:{sandbox_gid}:OpenShell Sandbox:/sandbox:/bin/bash"),
         |line| line.starts_with("sandbox:"),
     )?;
     ensure_line_in_file(
@@ -936,7 +972,9 @@ mod tests {
         fs::write(rootfs.join("bin/sed"), b"sed").expect("write sed");
         fs::write(rootfs.join("sbin/ip"), b"ip").expect("write ip");
 
-        prepare_sandbox_rootfs(&rootfs).expect("prepare sandbox rootfs");
+        // Use a non-standard UID so the test doesn't collide with the default.
+        let uid = 20001;
+        prepare_sandbox_rootfs(&rootfs, uid, uid).expect("prepare sandbox rootfs");
         validate_sandbox_rootfs(&rootfs).expect("validate sandbox rootfs");
 
         assert!(rootfs.join("srv/openshell-vm-sandbox-init.sh").is_file());
@@ -955,12 +993,14 @@ mod tests {
         assert!(
             fs::read_to_string(rootfs.join("etc/passwd"))
                 .expect("read passwd")
-                .contains("sandbox:x:10001:10001:OpenShell Sandbox:/sandbox:/bin/bash")
+                .contains(&format!(
+                    "sandbox:x:{uid}:{uid}:OpenShell Sandbox:/sandbox:/bin/bash"
+                ))
         );
         assert!(
             fs::read_to_string(rootfs.join("etc/group"))
                 .expect("read group")
-                .contains("sandbox:x:10001:")
+                .contains(&format!("sandbox:x:{uid}:"))
         );
         assert_eq!(
             fs::read_to_string(rootfs.join("etc/hosts")).expect("read hosts"),
@@ -980,7 +1020,7 @@ mod tests {
         fs::create_dir_all(rootfs.join("sandbox")).expect("create sandbox workdir");
         fs::write(rootfs.join("sandbox/app.py"), "print('hello')\n").expect("write app");
 
-        prepare_sandbox_rootfs(&rootfs).expect("prepare sandbox rootfs");
+        prepare_sandbox_rootfs(&rootfs, 10001, 10001).expect("prepare sandbox rootfs");
 
         assert!(rootfs.join("sandbox").is_dir());
         assert_eq!(
@@ -1119,6 +1159,61 @@ mod tests {
             Some("\"/tmp/path/with\\\\backslash/and\\\"quote\"".to_string())
         );
         assert_eq!(debugfs_quote_argument("/tmp/bad\npath"), None);
+    }
+
+    #[test]
+    fn formatter_candidates_preserve_executed_failure_over_missing_fallback() {
+        let candidates = vec![PathBuf::from("mke2fs"), PathBuf::from("missing")];
+
+        let err = run_ext4_formatter_candidates(candidates, |candidate| {
+            if candidate == Path::new("mke2fs") {
+                FormatterAttempt::Failed(
+                    "mke2fs failed with status 1\nstdout: formatter output\nstderr: no space left"
+                        .to_string(),
+                )
+            } else {
+                FormatterAttempt::Unavailable("missing not found".to_string())
+            }
+        })
+        .expect_err("formatter should fail");
+
+        assert!(err.contains("mke2fs failed with status 1"));
+        assert!(err.contains("no space left"));
+        assert!(!err.contains("missing not found"));
+    }
+
+    #[test]
+    fn formatter_candidates_report_all_missing_tools() {
+        let candidates = vec![PathBuf::from("mke2fs"), PathBuf::from("mkfs.ext4")];
+
+        let err = run_ext4_formatter_candidates(candidates, |candidate| {
+            FormatterAttempt::Unavailable(format!("{} not found", candidate.display()))
+        })
+        .expect_err("formatter should be unavailable");
+
+        assert!(err.contains("mke2fs not found"));
+        assert!(err.contains("mkfs.ext4 not found"));
+    }
+
+    #[test]
+    fn formatter_candidates_accept_successful_fallback() {
+        let candidates = vec![PathBuf::from("first"), PathBuf::from("second")];
+        let mut attempted = Vec::new();
+
+        run_ext4_formatter_candidates(candidates, |candidate| {
+            attempted.push(candidate.to_path_buf());
+            if candidate == Path::new("second") {
+                FormatterAttempt::Succeeded
+            } else {
+                FormatterAttempt::Failed("first failed".to_string())
+            }
+        })
+        .expect("fallback should succeed");
+
+        assert_eq!(
+            attempted,
+            vec![PathBuf::from("first"), PathBuf::from("second")]
+        );
     }
 
     fn unique_temp_dir() -> PathBuf {
