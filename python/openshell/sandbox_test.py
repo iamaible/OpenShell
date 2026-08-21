@@ -17,7 +17,7 @@ from typing import Any, cast
 import pytest
 
 import openshell.sandbox as sandbox_module
-from openshell._proto import openshell_pb2
+from openshell._proto import datamodel_pb2, openshell_pb2, sandbox_pb2
 from openshell.sandbox import (
     _PYTHON_CLOUDPICKLE_BOOTSTRAP,
     _SANDBOX_PYTHON_BIN,
@@ -1972,3 +1972,400 @@ def test_sandbox_session_delete_passes_workspace() -> None:
 
     assert stub.delete_request is not None
     assert stub.delete_request.workspace == "staging"
+
+
+# ---------------------------------------------------------------------------
+# Aible SDK extensions: providers, profiles, refresh, draft policy, config
+# ---------------------------------------------------------------------------
+
+
+class _FakeProviderPolicyStub:
+    """Fake stub for the provider/profile/refresh/draft/config wrappers."""
+
+    def __init__(self) -> None:
+        self.requests: dict[str, Any] = {}
+
+    def _record(self, name: str, request: Any) -> None:
+        self.requests[name] = request
+
+    def _provider_response(self, name: str) -> Any:
+        provider = datamodel_pb2.Provider(
+            metadata=datamodel_pb2.ObjectMeta(id="prov-1", name=name),
+            type="slack",
+            credentials={"SLACK_BOT_TOKEN": "REDACTED"},
+            config={"team": "aible"},
+            credential_expires_at_ms={"SLACK_BOT_TOKEN": 1234},
+            profile_workspace="default",
+        )
+        provider.credential_handles["SLACK_APP_TOKEN"].SetInParent()
+        return SimpleNamespace(provider=provider)
+
+    def GetSandbox(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("GetSandbox", request)
+        _ = timeout
+        sandbox = datamodel_pb2.Sandbox(
+            metadata=datamodel_pb2.ObjectMeta(
+                id="sb-1", name=request.name, created_at_ms=99
+            ),
+            status=openshell_pb2.SandboxStatus(
+                phase=openshell_pb2.SANDBOX_PHASE_READY, current_policy_version=7
+            ),
+        )
+        return SimpleNamespace(sandbox=sandbox)
+
+    def CreateProvider(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("CreateProvider", request)
+        _ = timeout
+        return self._provider_response(request.provider.metadata.name)
+
+    def GetProvider(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("GetProvider", request)
+        _ = timeout
+        return self._provider_response(request.name)
+
+    def ListProviders(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("ListProviders", request)
+        _ = timeout
+        return SimpleNamespace(
+            providers=[self._provider_response("p1").provider]
+        )
+
+    def UpdateProvider(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("UpdateProvider", request)
+        _ = timeout
+        return self._provider_response(request.provider.metadata.name)
+
+    def DeleteProvider(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("DeleteProvider", request)
+        _ = timeout
+        return SimpleNamespace(deleted=True)
+
+    def ListProviderProfiles(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("ListProviderProfiles", request)
+        _ = timeout
+        return SimpleNamespace(profiles=[])
+
+    def GetProviderProfile(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("GetProviderProfile", request)
+        _ = timeout
+        return SimpleNamespace(profile=openshell_pb2.ProviderProfile())
+
+    def ImportProviderProfiles(
+        self, request: Any, timeout: float | None = None
+    ) -> Any:
+        self._record("ImportProviderProfiles", request)
+        _ = timeout
+        return SimpleNamespace(imported=len(request.profiles))
+
+    def LintProviderProfiles(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("LintProviderProfiles", request)
+        _ = timeout
+        return SimpleNamespace(findings=[])
+
+    def UpdateProviderProfiles(
+        self, request: Any, timeout: float | None = None
+    ) -> Any:
+        self._record("UpdateProviderProfiles", request)
+        _ = timeout
+        return SimpleNamespace(profile=request.profile)
+
+    def DeleteProviderProfile(
+        self, request: Any, timeout: float | None = None
+    ) -> Any:
+        self._record("DeleteProviderProfile", request)
+        _ = timeout
+        return SimpleNamespace(deleted=True)
+
+    def ConfigureProviderRefresh(
+        self, request: Any, timeout: float | None = None
+    ) -> Any:
+        self._record("ConfigureProviderRefresh", request)
+        _ = timeout
+        return SimpleNamespace(ok=True)
+
+    def GetProviderRefreshStatus(
+        self, request: Any, timeout: float | None = None
+    ) -> Any:
+        self._record("GetProviderRefreshStatus", request)
+        _ = timeout
+        return SimpleNamespace(credentials=[])
+
+    def RotateProviderCredential(
+        self, request: Any, timeout: float | None = None
+    ) -> Any:
+        self._record("RotateProviderCredential", request)
+        _ = timeout
+        return SimpleNamespace(ok=True)
+
+    def DeleteProviderRefresh(
+        self, request: Any, timeout: float | None = None
+    ) -> Any:
+        self._record("DeleteProviderRefresh", request)
+        _ = timeout
+        return SimpleNamespace(deleted=True)
+
+    def GetDraftPolicy(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("GetDraftPolicy", request)
+        _ = timeout
+        chunk = openshell_pb2.PolicyChunk(
+            id="chunk-1",
+            status="pending",
+            rule_name="allow-slack",
+            binary="/usr/bin/node",
+            rationale="observed",
+            security_notes="",
+            confidence=0.9,
+            hit_count=3,
+            stage="candidate",
+            supersedes_chunk_id="chunk-0",
+            validation_result="ok",
+            rejection_reason="",
+            denial_summary_ids=["d1", "d2"],
+            created_at_ms=10,
+            decided_at_ms=0,
+            first_seen_ms=5,
+            last_seen_ms=9,
+        )
+        return SimpleNamespace(
+            chunks=[chunk],
+            rolling_summary="summary",
+            draft_version=4,
+            last_analyzed_at_ms=42,
+        )
+
+    def ApproveDraftChunk(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("ApproveDraftChunk", request)
+        _ = timeout
+        return SimpleNamespace(policy_version=8, policy_hash="abc")
+
+    def RejectDraftChunk(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("RejectDraftChunk", request)
+        _ = timeout
+        return SimpleNamespace()
+
+    def ApproveAllDraftChunks(
+        self, request: Any, timeout: float | None = None
+    ) -> Any:
+        self._record("ApproveAllDraftChunks", request)
+        _ = timeout
+        return SimpleNamespace(
+            policy_version=9, policy_hash="def", chunks_approved=2, chunks_skipped=1
+        )
+
+    def UpdateConfig(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("UpdateConfig", request)
+        _ = timeout
+        return SimpleNamespace(version=11, policy_hash="xyz", settings_revision=3)
+
+
+def test_get_full_forwards_workspace_and_maps_fields() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    full = client.get_full("job-1", workspace="team-a")
+
+    assert stub.requests["GetSandbox"].workspace == "team-a"
+    assert full.id == "sb-1"
+    assert full.name == "job-1"
+    assert full.namespace == ""
+    assert full.phase == openshell_pb2.SANDBOX_PHASE_READY
+    assert full.created_at_ms == 99
+    assert full.current_policy_version == 7
+
+
+def test_provider_crud_forwards_workspace() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    ref = client.create_provider(
+        workspace="default",
+        name="slack-bot",
+        provider_type="slack",
+        credentials={"SLACK_BOT_TOKEN": "xoxb-secret"},
+    )
+    assert stub.requests["CreateProvider"].workspace == "default"
+    assert ref.id == "prov-1"
+    assert ref.credential_expires_at_ms == {"SLACK_BOT_TOKEN": 1234}
+    assert ref.profile_workspace == "default"
+
+    client.get_provider("slack-bot", workspace="default")
+    assert stub.requests["GetProvider"].workspace == "default"
+
+    listed = client.list_providers(workspace="default", limit=5, offset=1)
+    assert stub.requests["ListProviders"].limit == 5
+    assert stub.requests["ListProviders"].offset == 1
+    assert len(listed) == 1
+
+    client.update_provider(
+        workspace="default",
+        name="slack-bot",
+        provider_type="slack",
+        credential_expires_at_ms={"SLACK_BOT_TOKEN": 777},
+    )
+    assert dict(stub.requests["UpdateProvider"].credential_expires_at_ms) == {
+        "SLACK_BOT_TOKEN": 777
+    }
+
+    assert client.delete_provider("slack-bot", workspace="default") is True
+    assert stub.requests["DeleteProvider"].workspace == "default"
+
+
+def test_provider_ref_unions_credential_and_handle_keys() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    ref = client.get_provider("slack-bot", workspace="default")
+
+    assert ref.credential_keys == ("SLACK_APP_TOKEN", "SLACK_BOT_TOKEN")
+    # values must never surface on the ref
+    assert not hasattr(ref, "credentials")
+
+
+def test_provider_profiles_forward_workspace_and_parse_dicts() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    client.list_provider_profiles(workspace="default")
+    assert stub.requests["ListProviderProfiles"].workspace == "default"
+
+    client.get_provider_profile("prof-1", workspace="default")
+    assert stub.requests["GetProviderProfile"].id == "prof-1"
+
+    client.import_provider_profiles(
+        [{"id": "slack", "display_name": "Slack"}], workspace="default"
+    )
+    imported = stub.requests["ImportProviderProfiles"]
+    assert imported.workspace == "default"
+    assert imported.profiles[0].profile.id == "slack"
+
+    client.lint_provider_profiles([{"id": "slack"}], workspace="default")
+    assert stub.requests["LintProviderProfiles"].workspace == "default"
+
+    client.update_provider_profile(
+        {"id": "slack"},
+        workspace="default",
+        profile_id="prof-1",
+        expected_resource_version=6,
+    )
+    updated = stub.requests["UpdateProviderProfiles"]
+    assert updated.id == "prof-1"
+    assert updated.expected_resource_version == 6
+
+    assert client.delete_provider_profile("prof-1", workspace="default") is True
+
+
+def test_configure_provider_refresh_maps_strategy_via_enum() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    client.configure_provider_refresh(
+        "slack-bot",
+        "SLACK_BOT_TOKEN",
+        "oauth2-refresh-token",
+        workspace="default",
+        material={"client_id": "abc"},
+        expires_at_ms=555,
+    )
+    req = stub.requests["ConfigureProviderRefresh"]
+    assert (
+        req.strategy
+        == openshell_pb2.PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_REFRESH_TOKEN
+    )
+    assert req.expires_at_ms == 555
+    assert req.workspace == "default"
+
+    client.configure_provider_refresh(
+        "aws-prov", "AWS_KEY", "aws_sts_assume_role", workspace="default"
+    )
+    assert (
+        stub.requests["ConfigureProviderRefresh"].strategy
+        == openshell_pb2.PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE
+    )
+
+
+def test_configure_provider_refresh_rejects_unknown_strategy() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    with pytest.raises(SandboxError, match="unknown provider refresh strategy"):
+        client.configure_provider_refresh(
+            "slack-bot", "KEY", "not-a-strategy", workspace="default"
+        )
+
+
+def test_refresh_status_rotate_delete_forward_workspace() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    client.get_provider_refresh_status("slack-bot", workspace="default")
+    assert stub.requests["GetProviderRefreshStatus"].workspace == "default"
+
+    client.rotate_provider_credential("slack-bot", "KEY", workspace="default")
+    assert stub.requests["RotateProviderCredential"].credential_key == "KEY"
+
+    assert (
+        client.delete_provider_refresh("slack-bot", "KEY", workspace="default") is True
+    )
+
+
+def test_get_draft_policy_maps_grown_chunk_fields() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    result = client.get_draft_policy("job-1", workspace="default")
+
+    assert stub.requests["GetDraftPolicy"].workspace == "default"
+    assert result.draft_version == 4
+    chunk = result.chunks[0]
+    assert chunk.stage == "candidate"
+    assert chunk.supersedes_chunk_id == "chunk-0"
+    assert chunk.validation_result == "ok"
+    assert chunk.denial_summary_ids == ("d1", "d2")
+    assert chunk.first_seen_ms == 5
+    assert chunk.endpoints == []  # proposed_rule unset
+
+
+def test_draft_chunk_decisions_forward_workspace() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    approved = client.approve_draft_chunk("job-1", "chunk-1", workspace="default")
+    assert approved.version == 8
+    assert stub.requests["ApproveDraftChunk"].workspace == "default"
+
+    client.reject_draft_chunk("job-1", "chunk-1", workspace="default", reason="nope")
+    assert stub.requests["RejectDraftChunk"].reason == "nope"
+
+    all_result = client.approve_all_draft_chunks(
+        "job-1", workspace="default", include_security_flagged=True
+    )
+    assert all_result.chunks_approved == 2
+    assert all_result.chunks_skipped == 1
+    assert stub.requests["ApproveAllDraftChunks"].include_security_flagged is True
+
+
+def test_update_config_requires_sandbox_policy_type() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    with pytest.raises(TypeError, match="SandboxPolicy"):
+        client.update_config("job-1", {"not": "a proto"}, workspace="default")
+
+
+def test_update_config_forwards_workspace_and_maps_result() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    result = client.update_config(
+        "job-1",
+        sandbox_pb2.SandboxPolicy(),
+        workspace="default",
+        expected_resource_version=2,
+    )
+
+    req = stub.requests["UpdateConfig"]
+    assert req.workspace == "default"
+    assert req.expected_resource_version == 2
+    assert result.version == 11
+    assert result.policy_hash == "xyz"
+    assert result.settings_revision == 3

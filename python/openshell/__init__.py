@@ -6,13 +6,19 @@
 from __future__ import annotations
 
 from .sandbox import (
+    ApproveAllResult,
+    DraftChunkRef,
+    DraftPolicyResult,
     ExecChunk,
     ExecResult,
     InferenceRouteClient,
     InferenceRouteConfig,
+    PolicyUpdateResult,
+    ProviderRef,
     Sandbox,
     SandboxClient,
     SandboxError,
+    SandboxFull,
     SandboxRef,
     SandboxSession,
     SandboxStatusRef,
@@ -29,13 +35,19 @@ except Exception:
     __version__ = "0.0.0"
 
 __all__ = [
+    "ApproveAllResult",
+    "DraftChunkRef",
+    "DraftPolicyResult",
     "ExecChunk",
     "ExecResult",
     "InferenceRouteClient",
     "InferenceRouteConfig",
+    "PolicyUpdateResult",
+    "ProviderRef",
     "Sandbox",
     "SandboxClient",
     "SandboxError",
+    "SandboxFull",
     "SandboxRef",
     "SandboxSession",
     "SandboxStatusRef",

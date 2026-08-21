@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 
 import grpc
 import httpx
+from google.protobuf import json_format
 
 from ._proto import (
     datamodel_pb2,
@@ -177,6 +178,82 @@ class SandboxRef:
     @property
     def current_policy_version(self) -> int:
         return self.status.current_policy_version
+
+
+@dataclass(frozen=True)
+class SandboxFull:
+    """Full sandbox view (spec + status protos) returned by `get_full`."""
+
+    id: str
+    name: str
+    namespace: str  # removed from proto; retained for caller compat, always ""
+    phase: int
+    spec: object  # datamodel_pb2.SandboxSpec
+    status: object  # datamodel_pb2.SandboxStatus
+    created_at_ms: int
+    current_policy_version: int
+
+
+@dataclass(frozen=True)
+class ProviderRef:
+    id: str
+    name: str
+    type: str
+    config: dict[str, str]
+    # Names of stored credentials on the gateway. Values are intentionally
+    # not exposed — the gateway redacts them on the wire. Callers needing
+    # to verify a provider holds a specific credential (e.g. SLACK_BOT_TOKEN)
+    # check membership in credential_keys. Includes driver-stored credential
+    # handles as well as legacy inline credential keys.
+    credential_keys: tuple[str, ...] = ()
+    # Per-credential-key expiry timestamps (ms since epoch), when known.
+    credential_expires_at_ms: dict[str, int] = field(default_factory=dict)
+    profile_workspace: str = ""
+
+
+@dataclass(frozen=True)
+class DraftChunkRef:
+    id: str
+    status: str
+    rule_name: str
+    binary: str
+    rationale: str
+    security_notes: str
+    confidence: float
+    hit_count: int
+    endpoints: list[object]  # list of NetworkEndpoint proto messages
+    stage: str = ""
+    supersedes_chunk_id: str = ""
+    validation_result: str = ""
+    rejection_reason: str = ""
+    denial_summary_ids: tuple[str, ...] = ()
+    created_at_ms: int = 0
+    decided_at_ms: int = 0
+    first_seen_ms: int = 0
+    last_seen_ms: int = 0
+
+
+@dataclass(frozen=True)
+class DraftPolicyResult:
+    chunks: list[DraftChunkRef]
+    rolling_summary: str
+    draft_version: int
+    last_analyzed_at_ms: int
+
+
+@dataclass(frozen=True)
+class PolicyUpdateResult:
+    version: int
+    policy_hash: str
+    settings_revision: int = 0
+
+
+@dataclass(frozen=True)
+class ApproveAllResult:
+    version: int
+    policy_hash: str
+    chunks_approved: int
+    chunks_skipped: int
 
 
 @dataclass(frozen=True)
@@ -743,6 +820,392 @@ class SandboxClient:
             timeout_seconds=timeout_seconds,
         )
 
+    # ------------------------------------------------------------------
+    # Full sandbox view
+    # ------------------------------------------------------------------
+
+    def get_full(self, sandbox_name: str, *, workspace: str) -> SandboxFull:
+        response = self._stub.GetSandbox(
+            openshell_pb2.GetSandboxRequest(name=sandbox_name, workspace=workspace),
+            timeout=self._timeout,
+        )
+        sb = response.sandbox
+        return SandboxFull(
+            id=sb.metadata.id if sb.metadata else "",
+            name=sb.metadata.name if sb.metadata else "",
+            namespace="",
+            phase=sb.status.phase if sb.status else 0,
+            spec=sb.spec,
+            status=sb.status,
+            created_at_ms=sb.metadata.created_at_ms if sb.metadata else 0,
+            current_policy_version=(
+                sb.status.current_policy_version if sb.status else 0
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Provider CRUD
+    # ------------------------------------------------------------------
+
+    def create_provider(
+        self,
+        *,
+        workspace: str,
+        name: str,
+        provider_type: str,
+        credentials: dict[str, str] | None = None,
+        config: dict[str, str] | None = None,
+    ) -> ProviderRef:
+        provider = datamodel_pb2.Provider(
+            metadata=datamodel_pb2.ObjectMeta(name=name),
+            type=provider_type,
+            credentials=credentials or {},
+            config=config or {},
+        )
+        response = self._stub.CreateProvider(
+            openshell_pb2.CreateProviderRequest(provider=provider, workspace=workspace),
+            timeout=self._timeout,
+        )
+        return _provider_ref(response.provider)
+
+    def get_provider(self, name: str, *, workspace: str) -> ProviderRef:
+        response = self._stub.GetProvider(
+            openshell_pb2.GetProviderRequest(name=name, workspace=workspace),
+            timeout=self._timeout,
+        )
+        return _provider_ref(response.provider)
+
+    def list_providers(
+        self, *, workspace: str, limit: int = 100, offset: int = 0
+    ) -> builtins.list[ProviderRef]:
+        response = self._stub.ListProviders(
+            openshell_pb2.ListProvidersRequest(
+                workspace=workspace, limit=limit, offset=offset
+            ),
+            timeout=self._timeout,
+        )
+        return [_provider_ref(p) for p in response.providers]
+
+    def update_provider(
+        self,
+        *,
+        workspace: str,
+        name: str,
+        provider_type: str,
+        credentials: dict[str, str] | None = None,
+        config: dict[str, str] | None = None,
+        credential_expires_at_ms: dict[str, int] | None = None,
+    ) -> ProviderRef:
+        provider = datamodel_pb2.Provider(
+            metadata=datamodel_pb2.ObjectMeta(name=name),
+            type=provider_type,
+            credentials=credentials or {},
+            config=config or {},
+        )
+        request = openshell_pb2.UpdateProviderRequest(
+            provider=provider,
+            workspace=workspace,
+            credential_expires_at_ms=credential_expires_at_ms or {},
+        )
+        response = self._stub.UpdateProvider(request, timeout=self._timeout)
+        return _provider_ref(response.provider)
+
+    def delete_provider(self, name: str, *, workspace: str) -> bool:
+        response = self._stub.DeleteProvider(
+            openshell_pb2.DeleteProviderRequest(name=name, workspace=workspace),
+            timeout=self._timeout,
+        )
+        return bool(response.deleted)
+
+    # ------------------------------------------------------------------
+    # Provider profiles
+    # ------------------------------------------------------------------
+
+    def list_provider_profiles(
+        self, *, workspace: str, limit: int = 100, offset: int = 0
+    ) -> builtins.list[object]:
+        response = self._stub.ListProviderProfiles(
+            openshell_pb2.ListProviderProfilesRequest(
+                workspace=workspace, limit=limit, offset=offset
+            ),
+            timeout=self._timeout,
+        )
+        return list(response.profiles)
+
+    def get_provider_profile(self, profile_id: str, *, workspace: str) -> object:
+        response = self._stub.GetProviderProfile(
+            openshell_pb2.GetProviderProfileRequest(id=profile_id, workspace=workspace),
+            timeout=self._timeout,
+        )
+        return response.profile
+
+    def import_provider_profiles(
+        self, profiles: builtins.list[dict], *, workspace: str
+    ) -> openshell_pb2.ImportProviderProfilesResponse:
+        items = [
+            openshell_pb2.ProviderProfileImportItem(
+                profile=json_format.ParseDict(p, openshell_pb2.ProviderProfile()),
+                source=p.get("source", ""),
+            )
+            for p in profiles
+        ]
+        return self._stub.ImportProviderProfiles(
+            openshell_pb2.ImportProviderProfilesRequest(
+                profiles=items, workspace=workspace
+            ),
+            timeout=self._timeout,
+        )
+
+    def lint_provider_profiles(
+        self, profiles: builtins.list[dict], *, workspace: str
+    ) -> openshell_pb2.LintProviderProfilesResponse:
+        items = [
+            openshell_pb2.ProviderProfileImportItem(
+                profile=json_format.ParseDict(p, openshell_pb2.ProviderProfile()),
+                source=p.get("source", ""),
+            )
+            for p in profiles
+        ]
+        return self._stub.LintProviderProfiles(
+            openshell_pb2.LintProviderProfilesRequest(
+                profiles=items, workspace=workspace
+            ),
+            timeout=self._timeout,
+        )
+
+    def update_provider_profile(
+        self,
+        profile: dict,
+        *,
+        workspace: str,
+        profile_id: str = "",
+        expected_resource_version: int = 0,
+    ) -> object:
+        """Update one provider profile in place (UpdateProviderProfiles RPC)."""
+        item = openshell_pb2.ProviderProfileImportItem(
+            profile=json_format.ParseDict(profile, openshell_pb2.ProviderProfile()),
+            source=profile.get("source", ""),
+        )
+        response = self._stub.UpdateProviderProfiles(
+            openshell_pb2.UpdateProviderProfilesRequest(
+                profile=item,
+                id=profile_id,
+                expected_resource_version=expected_resource_version,
+                workspace=workspace,
+            ),
+            timeout=self._timeout,
+        )
+        return response
+
+    def delete_provider_profile(self, profile_id: str, *, workspace: str) -> bool:
+        response = self._stub.DeleteProviderProfile(
+            openshell_pb2.DeleteProviderProfileRequest(
+                id=profile_id, workspace=workspace
+            ),
+            timeout=self._timeout,
+        )
+        return bool(response.deleted)
+
+    # ------------------------------------------------------------------
+    # Provider credential refresh
+    # ------------------------------------------------------------------
+
+    def configure_provider_refresh(
+        self,
+        provider_name: str,
+        credential_key: str,
+        strategy: str = "",
+        *,
+        workspace: str,
+        material: dict[str, str] | None = None,
+        secret_material_keys: builtins.list[str] | None = None,
+        expires_at_ms: int | None = None,
+    ) -> object:
+        """Configure gateway-owned refresh material for one provider credential."""
+        req = openshell_pb2.ConfigureProviderRefreshRequest(
+            provider=provider_name,
+            credential_key=credential_key,
+            strategy=_refresh_strategy_value(strategy),
+            material=material or {},
+            secret_material_keys=secret_material_keys or [],
+            workspace=workspace,
+        )
+        if expires_at_ms is not None:
+            req.expires_at_ms = expires_at_ms
+        return self._stub.ConfigureProviderRefresh(req, timeout=self._timeout)
+
+    def get_provider_refresh_status(
+        self,
+        provider_name: str,
+        credential_key: str = "",
+        *,
+        workspace: str,
+    ) -> builtins.list[object]:
+        """Get credential refresh status for a provider."""
+        response = self._stub.GetProviderRefreshStatus(
+            openshell_pb2.GetProviderRefreshStatusRequest(
+                provider=provider_name,
+                credential_key=credential_key,
+                workspace=workspace,
+            ),
+            timeout=self._timeout,
+        )
+        return list(response.credentials)
+
+    def rotate_provider_credential(
+        self,
+        provider_name: str,
+        credential_key: str,
+        *,
+        workspace: str,
+    ) -> object:
+        """Force an immediate credential rotation for a provider."""
+        return self._stub.RotateProviderCredential(
+            openshell_pb2.RotateProviderCredentialRequest(
+                provider=provider_name,
+                credential_key=credential_key,
+                workspace=workspace,
+            ),
+            timeout=self._timeout,
+        )
+
+    def delete_provider_refresh(
+        self,
+        provider_name: str,
+        credential_key: str,
+        *,
+        workspace: str,
+    ) -> bool:
+        """Remove a credential refresh configuration."""
+        response = self._stub.DeleteProviderRefresh(
+            openshell_pb2.DeleteProviderRefreshRequest(
+                provider=provider_name,
+                credential_key=credential_key,
+                workspace=workspace,
+            ),
+            timeout=self._timeout,
+        )
+        return bool(response.deleted)
+
+    # ------------------------------------------------------------------
+    # Draft policy recommendations
+    # ------------------------------------------------------------------
+
+    def get_draft_policy(
+        self,
+        sandbox_name: str,
+        *,
+        workspace: str,
+        status_filter: str = "",
+    ) -> DraftPolicyResult:
+        response = self._stub.GetDraftPolicy(
+            openshell_pb2.GetDraftPolicyRequest(
+                name=sandbox_name,
+                status_filter=status_filter,
+                workspace=workspace,
+            ),
+            timeout=self._timeout,
+        )
+        return DraftPolicyResult(
+            chunks=[_draft_chunk_ref(c) for c in response.chunks],
+            rolling_summary=response.rolling_summary,
+            draft_version=response.draft_version,
+            last_analyzed_at_ms=response.last_analyzed_at_ms,
+        )
+
+    def approve_draft_chunk(
+        self,
+        sandbox_name: str,
+        chunk_id: str,
+        *,
+        workspace: str,
+    ) -> PolicyUpdateResult:
+        response = self._stub.ApproveDraftChunk(
+            openshell_pb2.ApproveDraftChunkRequest(
+                name=sandbox_name,
+                chunk_id=chunk_id,
+                workspace=workspace,
+            ),
+            timeout=self._timeout,
+        )
+        return PolicyUpdateResult(
+            version=response.policy_version,
+            policy_hash=response.policy_hash,
+        )
+
+    def reject_draft_chunk(
+        self,
+        sandbox_name: str,
+        chunk_id: str,
+        *,
+        workspace: str,
+        reason: str = "",
+    ) -> None:
+        self._stub.RejectDraftChunk(
+            openshell_pb2.RejectDraftChunkRequest(
+                name=sandbox_name,
+                chunk_id=chunk_id,
+                reason=reason,
+                workspace=workspace,
+            ),
+            timeout=self._timeout,
+        )
+
+    def approve_all_draft_chunks(
+        self,
+        sandbox_name: str,
+        *,
+        workspace: str,
+        include_security_flagged: bool = False,
+    ) -> ApproveAllResult:
+        response = self._stub.ApproveAllDraftChunks(
+            openshell_pb2.ApproveAllDraftChunksRequest(
+                name=sandbox_name,
+                include_security_flagged=include_security_flagged,
+                workspace=workspace,
+            ),
+            timeout=self._timeout,
+        )
+        return ApproveAllResult(
+            version=response.policy_version,
+            policy_hash=response.policy_hash,
+            chunks_approved=response.chunks_approved,
+            chunks_skipped=response.chunks_skipped,
+        )
+
+    # ------------------------------------------------------------------
+    # Policy updates
+    # ------------------------------------------------------------------
+
+    def update_config(
+        self,
+        sandbox_name: str,
+        policy: object,
+        *,
+        workspace: str,
+        expected_resource_version: int = 0,
+    ) -> PolicyUpdateResult:
+        from ._proto import sandbox_pb2  # local import to avoid import cycle
+
+        if not isinstance(policy, sandbox_pb2.SandboxPolicy):
+            raise TypeError(
+                f"policy must be a SandboxPolicy proto message, got {type(policy)}"
+            )
+        response = self._stub.UpdateConfig(
+            openshell_pb2.UpdateConfigRequest(
+                name=sandbox_name,
+                policy=policy,
+                workspace=workspace,
+                expected_resource_version=expected_resource_version,
+            ),
+            timeout=self._timeout,
+        )
+        return PolicyUpdateResult(
+            version=response.version,
+            policy_hash=response.policy_hash,
+            settings_revision=response.settings_revision,
+        )
+
 
 @dataclass(frozen=True)
 class InferenceRouteConfig:
@@ -1095,6 +1558,65 @@ def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
         ),
         labels=sandbox.metadata.labels if sandbox.metadata else {},
     )
+
+
+def _provider_ref(provider: datamodel_pb2.Provider) -> ProviderRef:
+    # The gateway redacts credential values and folds driver-stored handle
+    # keys into `credentials`; union with `credential_handles` regardless so
+    # key visibility doesn't depend on gateway version.
+    keys = set(provider.credentials.keys()) | set(provider.credential_handles.keys())
+    return ProviderRef(
+        id=provider.metadata.id if provider.metadata else "",
+        name=provider.metadata.name if provider.metadata else "",
+        type=provider.type,
+        config=dict(provider.config),
+        credential_keys=tuple(sorted(keys)),
+        credential_expires_at_ms=dict(provider.credential_expires_at_ms),
+        profile_workspace=provider.profile_workspace,
+    )
+
+
+def _draft_chunk_ref(chunk: openshell_pb2.PolicyChunk) -> DraftChunkRef:
+    return DraftChunkRef(
+        id=chunk.id,
+        status=chunk.status,
+        rule_name=chunk.rule_name,
+        binary=chunk.binary,
+        rationale=chunk.rationale,
+        security_notes=chunk.security_notes,
+        confidence=chunk.confidence,
+        hit_count=chunk.hit_count,
+        endpoints=list(chunk.proposed_rule.endpoints)
+        if chunk.HasField("proposed_rule")
+        else [],
+        stage=chunk.stage,
+        supersedes_chunk_id=chunk.supersedes_chunk_id,
+        validation_result=chunk.validation_result,
+        rejection_reason=chunk.rejection_reason,
+        denial_summary_ids=tuple(chunk.denial_summary_ids),
+        created_at_ms=chunk.created_at_ms,
+        decided_at_ms=chunk.decided_at_ms,
+        first_seen_ms=chunk.first_seen_ms,
+        last_seen_ms=chunk.last_seen_ms,
+    )
+
+
+def _refresh_strategy_value(strategy: str) -> int:
+    """Map a human strategy name to the generated proto enum value.
+
+    Accepts e.g. "oauth2_refresh_token" / "oauth2-refresh-token" /
+    "aws_sts_assume_role"; empty string maps to UNSPECIFIED. Using the
+    generated enum keeps this in lockstep with proto additions.
+    """
+    if not strategy:
+        return openshell_pb2.PROVIDER_CREDENTIAL_REFRESH_STRATEGY_UNSPECIFIED
+    symbol = "PROVIDER_CREDENTIAL_REFRESH_STRATEGY_" + strategy.upper().replace(
+        "-", "_"
+    )
+    try:
+        return openshell_pb2.ProviderCredentialRefreshStrategy.Value(symbol)
+    except ValueError:
+        raise SandboxError(f"unknown provider refresh strategy: {strategy!r}") from None
 
 
 def _default_spec() -> openshell_pb2.SandboxSpec:
