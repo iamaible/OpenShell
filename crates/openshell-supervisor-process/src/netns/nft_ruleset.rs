@@ -70,6 +70,15 @@ pub fn generate_bypass_commands(
                 "accept",
             ],
         ),
+        // Allow direct TLS to the host gateway (inference.local listener on
+        // host_ip:443) for clients that do not honor HTTPS_PROXY.
+        nft_cmd(
+            true,
+            &[
+                "add", "rule", "inet", table, "output", "ip", "daddr", host_ip, "tcp", "dport",
+                "443", "accept",
+            ],
+        ),
         nft_cmd(
             true,
             &[
@@ -407,18 +416,21 @@ mod tests {
         let cmds = generate_bypass_commands("172.16.0.1", 9999, None);
         let text = all_strs(&cmds);
         assert!(text.contains("ip daddr 172.16.0.1 tcp dport 9999 accept"));
+        assert!(text.contains("ip daddr 172.16.0.1 tcp dport 443 accept"));
     }
 
     #[test]
     fn rules_are_ordered_accept_then_reject() {
         let cmds = generate_bypass_commands("10.0.2.2", 8080, None);
         let text = all_strs(&cmds);
-        let proxy_pos = text.find("ip daddr").unwrap();
+        let proxy_pos = text.find("tcp dport 8080 accept").unwrap();
+        let inference_pos = text.find("tcp dport 443 accept").unwrap();
         let lo_pos = text.find("oifname lo").unwrap();
         let ct_pos = text.find("ct state established,related").unwrap();
         let reject_pos = text.find("reject with icmp type").unwrap();
 
-        assert!(proxy_pos < lo_pos);
+        assert!(proxy_pos < inference_pos);
+        assert!(inference_pos < lo_pos);
         assert!(lo_pos < ct_pos);
         assert!(ct_pos < reject_pos);
     }

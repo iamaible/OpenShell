@@ -3,32 +3,59 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Supervisor image build.
+# Aible fork of the OpenShell supervisor image.
 #
-# The final image carries the static `openshell-sandbox` binary used by Docker
-# extraction, Podman image volumes, and the Kubernetes init container copy-self
-# path. It also includes nftables so the Kubernetes supervisor sidecar can
-# install pod-namespace egress enforcement rules.
+# The supervisor carries the `openshell-sandbox` binary, which the
+# agent-sandbox-controller copies into every sandbox pod via an init container.
+# Inside the sandbox the binary acts as PID 1: process supervision, policy
+# enforcement, SSH server, and gRPC callback to the gateway.
 #
-# The Rust binary is built natively before this image build runs and staged at:
-#   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-sandbox
+# The gateway and supervisor must be compiled from the same source tree so
+# their protobuf schemas stay in sync.
 #
-# Use tasks/scripts/docker-build-image.sh supervisor (or `mise run build:docker:supervisor`)
-# to stage the binary and build the image in one step. CI builds the binary
-# per-architecture via the `rust-native-build.yml` workflow (with the musl
-# target) and uploads it as an artifact, which is downloaded into the same
-# staging directory before the image build job runs.
+# Build:
+#   IMAGE_TAG=20260521 tasks/scripts/docker-build-local.sh supervisor
+#
+# Unlike the gateway, the upstream supervisor image is FROM scratch (statically
+# linked). Our cargo build produces a dynamically linked binary that needs
+# glibc + ld-linux at runtime, so we use debian-slim as the final base.
+ARG BASE_IMAGE=debian:trixie-slim
 
-FROM alpine:3.22 AS supervisor
+# ---------------------------------------------------------------------------
+# Stage 1: Compile sandbox binary from source
+# ---------------------------------------------------------------------------
+FROM rust:1.95.0-slim-trixie AS builder
 
-ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    clang \
+    libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN apk add --no-cache nftables iptables iptables-legacy
+WORKDIR /build
 
-# --chmod=0555 restores execute bits after the actions/upload-artifact +
-# download-artifact roundtrip strips them. Ownership stays root (0:0) for
-# Podman image-volume mounts, while world-execute lets the Kubernetes
-# network sidecar run this binary as the dedicated non-root proxy UID.
-COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /openshell-sandbox
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY proto/ proto/
+COPY providers/ providers/
 
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release \
+        --bin openshell-sandbox \
+    && mkdir -p /out \
+    && install -m 0755 target/release/openshell-sandbox /out/openshell-sandbox
+
+# ---------------------------------------------------------------------------
+# Stage 2: Layer compiled binary onto the base image
+# ---------------------------------------------------------------------------
+FROM ${BASE_IMAGE}
+
+# Match the upstream image's binary path and entrypoint so the inner chart's
+# supervisor.image reference works without changes.
+COPY --from=builder /out/openshell-sandbox /openshell-sandbox
 ENTRYPOINT ["/openshell-sandbox"]
