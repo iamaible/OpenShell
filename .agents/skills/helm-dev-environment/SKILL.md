@@ -26,9 +26,10 @@ mise run helm:k3s:create
 ```
 
 Creates a k3d cluster and merges its kubeconfig into the worktree-local `kubeconfig` file.
-Also applies base manifests (`deploy/kube/manifests/agent-sandbox.yaml`) and preloads the
-default community sandbox image into k3d so the first sandbox create does not wait on a
-large registry pull. Traefik is disabled at cluster creation time.
+Also applies the upstream agent-sandbox CRDs/controller (pinned via `AGENT_SANDBOX_VERSION`
+in `tasks/scripts/helm-k3s-local.sh`, fetched from `github.com/kubernetes-sigs/agent-sandbox`
+releases) and preloads the default community sandbox image into k3d so the first sandbox
+create does not wait on a large registry pull. Traefik is disabled at cluster creation time.
 
 **Multi-worktree support:** the cluster name is derived from the last component of the
 current git branch (e.g. branch `kube-support/local-dev/tmutch` → cluster
@@ -59,20 +60,39 @@ mise run helm:skaffold:dev
 mise run helm:skaffold:run
 ```
 
+**Supervisor sidecar topology** (build once and leave running):
+```bash
+mise run helm:skaffold:run:sidecar
+```
+
+**Supervisor sidecar topology with TLS/mTLS enabled** (build once and leave running):
+```bash
+mise run helm:skaffold:run:sidecar-mtls
+```
+
 Both commands build the `gateway` and `supervisor` images and deploy the OpenShell Helm
-chart. The `pkiInitJob` hook (a pre-install Job that runs `openshell-gateway generate-certs`)
-generates mTLS secrets on first install. Envoy Gateway opt-in; see the Optional Add-ons section below.
+chart. The sidecar profile renders an `openshell-network-init` init container for
+nftables setup and an `openshell-supervisor-network` runtime sidecar for proxying.
+Binary-aware policy mode runs that sidecar as UID 0 with `SYS_PTRACE` and
+`DAC_READ_SEARCH`; relaxed mode can run it as the configured proxy UID, which
+must be at least `1000` and distinct from the workload UID. The
+sidecar-mTLS profile reuses `ci/values-sidecar.yaml` and restores
+`server.disableTls=false` inline for Skaffold. The `pkiInitJob` hook (a pre-install
+Job that runs `openshell-gateway generate-certs`) generates mTLS secrets on first
+install. Envoy Gateway opt-in; see the Optional Add-ons section below.
 
 The gateway Service uses ClusterIP. Access is via Envoy Gateway (port `8080`) or `kubectl port-forward`.
 
-**HA test deploy** (two gateway replicas + bundled PostgreSQL): uncomment
+**HA test deploy** (two gateway replicas + external PostgreSQL Secret): uncomment
 `#- ci/values-high-availability.yaml` in `deploy/helm/openshell/skaffold.yaml`,
-then run `mise run helm:skaffold:run` or `mise run helm:skaffold:dev`.
+create the Secret named `openshell-ha-pg` with a `uri` key, then run
+`mise run helm:skaffold:run` or `mise run helm:skaffold:dev`.
 
 ### TLS behaviour
 
 `ci/values-skaffold.yaml` sets `server.disableTls: true`, so Skaffold-based deploys run
-plaintext by default. To test with TLS enabled, comment out that line and redeploy.
+plaintext by default. To test sidecar topology with TLS enabled, use
+`mise run helm:skaffold:run:sidecar-mtls`.
 
 | Mode | `server.disableTls` | Gateway scheme |
 |------|---------------------|----------------|
@@ -122,6 +142,12 @@ openshell sandbox list --gateway-endpoint https://localhost:8090
 
 ```bash
 mise run helm:skaffold:delete
+```
+
+For a sidecar-profile deployment:
+
+```bash
+mise run helm:skaffold:delete:sidecar
 ```
 
 ### Delete the cluster entirely
@@ -176,9 +202,26 @@ To remove Keycloak:
 mise run keycloak:k8s:teardown
 ```
 
+### SPIRE / SPIFFE Provider Token Grants
+
+Skaffold can install SPIRE with the SPIFFE hardened Helm charts. To activate
+SPIFFE JWT-SVIDs for dynamic provider token grants:
+
+1. Uncomment the `spire-crds` and `spire` releases in `deploy/helm/openshell/skaffold.yaml`
+2. Uncomment `#- ci/values-spire.yaml` in the OpenShell release values files
+3. Redeploy: `mise run helm:skaffold:run`
+
+`ci/values-spire-stack.yaml` configures the local SPIRE trust domain as
+`openshell.local` and adds a `ClusterSPIFFEID` that maps sandbox pod
+annotations to `spiffe://openshell.local/openshell/sandbox/<sandbox-id>`.
+OpenShell mounts the SPIFFE CSI Workload API socket at
+`/spiffe-workload-api/spire-agent.sock` into sandbox pods for provider token
+grants. Supervisor-to-gateway authentication remains on the Kubernetes
+ServiceAccount bootstrap and gateway-minted sandbox JWT path.
+
 ---
 
-## Cluster Lifecycle (suspend/resume)
+## Cluster Lifecycle (stop/start)
 
 Stop the cluster without losing state (faster than delete/recreate):
 ```bash
@@ -193,6 +236,33 @@ mise run helm:k3s:status
 
 ---
 
+## Helm Chart Checks
+
+Run the chart lint task before changing Helm templates, values overlays, or
+Skaffold inputs:
+
+```bash
+mise run helm:lint
+```
+
+If Helm reports missing chart dependencies, remove the specific stale subchart
+archive or directory named by the error from `deploy/helm/openshell/charts/`,
+then rerun the lint task.
+
+For example, when lint reports `chart metadata is missing these dependencies:
+postgresql`, remove stale PostgreSQL chart artifacts:
+
+```bash
+rm -f deploy/helm/openshell/charts/postgresql-*.tgz
+rm -rf deploy/helm/openshell/charts/postgresql
+mise run helm:lint
+```
+
+The `charts/` directory is ignored and regenerated by `helm dependency build`
+for dependencies still declared in `Chart.yaml`.
+
+---
+
 ## Key Files
 
 | Path | Purpose |
@@ -202,8 +272,11 @@ mise run helm:k3s:status
 | `deploy/helm/openshell/ci/values-skaffold.yaml` | Dev overrides (image pull policy, TLS disabled for local Skaffold) |
 | `deploy/helm/openshell/ci/values-cert-manager.yaml` | cert-manager PKI overlay (opt-in; disables pkiInitJob) |
 | `deploy/helm/openshell/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
-| `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with bundled PostgreSQL) |
+| `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
 | `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |
+| `deploy/helm/openshell/ci/values-sidecar.yaml` | Supervisor sidecar topology overlay for Kubernetes e2e/dev |
+| `deploy/helm/openshell/ci/values-spire.yaml` | SPIFFE/SPIRE provider token grant overlay |
+| `deploy/helm/openshell/ci/values-spire-stack.yaml` | SPIRE hardened chart values for local dev |
 | `deploy/helm/openshell/ci/values-tls-disabled.yaml` | Lint-only: TLS + auth disabled (reverse-proxy edge termination) |
 | `deploy/kube/manifests/envoy-gateway-openshell.yaml` | GatewayClass for Envoy Gateway (`mise run helm:gateway:apply`) |
 | `tasks/scripts/helm-k3s-local.sh` | k3d cluster create/delete/start/stop/status |

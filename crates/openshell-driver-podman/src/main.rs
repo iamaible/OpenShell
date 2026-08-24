@@ -9,10 +9,10 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use openshell_core::VERSION;
-use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_podman::config::{
-    DEFAULT_NETWORK_NAME, DEFAULT_SANDBOX_PIDS_LIMIT, ImagePullPolicy,
+    DEFAULT_NETWORK_NAME, DEFAULT_PODMAN_STOP_TIMEOUT_SECS, DEFAULT_SANDBOX_PIDS_LIMIT,
+    ImagePullPolicy,
 };
 use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanComputeDriver};
 
@@ -67,7 +67,7 @@ struct Args {
     #[arg(
         long,
         env = "OPENSHELL_SANDBOX_SSH_SOCKET_PATH",
-        default_value = "/run/openshell/ssh.sock"
+        default_value = openshell_core::container_paths::SSH_SOCKET_PATH
     )]
     sandbox_ssh_socket_path: String,
 
@@ -76,7 +76,7 @@ struct Args {
     network_name: String,
 
     /// Container stop timeout in seconds (SIGTERM → SIGKILL).
-    #[arg(long, env = "OPENSHELL_STOP_TIMEOUT", default_value_t = DEFAULT_STOP_TIMEOUT_SECS)]
+    #[arg(long, env = "OPENSHELL_STOP_TIMEOUT", default_value_t = DEFAULT_PODMAN_STOP_TIMEOUT_SECS)]
     stop_timeout: u32,
 
     /// Container cgroup PID limit for sandbox containers. Set 0 to inherit
@@ -90,7 +90,7 @@ struct Args {
 
     /// OCI image containing the openshell-sandbox supervisor binary.
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
-    supervisor_image: String,
+    supervisor_image: Option<String>,
 
     /// Host path to the CA certificate for sandbox mTLS.
     #[arg(long, env = "OPENSHELL_PODMAN_TLS_CA")]
@@ -103,6 +103,51 @@ struct Args {
     /// Host path to the client private key for sandbox mTLS.
     #[arg(long, env = "OPENSHELL_PODMAN_TLS_KEY")]
     podman_tls_key: Option<PathBuf>,
+
+    /// Corporate forward proxy URL for the supervisor's upstream TLS dials,
+    /// in explicit `http://host:port` form (scheme and port required).
+    /// Credentials must not be embedded in the URL; use
+    /// `--sandbox-proxy-auth-file` instead.
+    #[arg(long, env = "OPENSHELL_SANDBOX_HTTPS_PROXY")]
+    sandbox_https_proxy: Option<String>,
+
+    /// Comma-separated `NO_PROXY` list injected alongside the proxy URL.
+    #[arg(long, env = "OPENSHELL_SANDBOX_NO_PROXY")]
+    sandbox_no_proxy: Option<String>,
+
+    /// Path to a file containing the corporate proxy credentials as
+    /// `user:pass`. Delivered to the supervisor through a root-only secret
+    /// mount so the credentials never appear in config or container metadata.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_AUTH_FILE")]
+    sandbox_proxy_auth_file: Option<String>,
+
+    /// Explicit acknowledgement (`true`) that the proxy credential is sent
+    /// as cleartext Basic auth over the plain-TCP connection to the http://
+    /// proxy. Required when `--sandbox-proxy-auth-file` is set.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_AUTH_ALLOW_INSECURE")]
+    sandbox_proxy_auth_allow_insecure: Option<bool>,
+
+    /// Send the destination hostname in CONNECT requests to the corporate
+    /// proxy instead of a validated IP. Only for proxies whose ACLs filter
+    /// on hostnames: the proxy then resolves the name itself, so sandbox
+    /// SSRF/`allowed_ips` validation no longer binds the connection.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PROXY_CONNECT_BY_HOSTNAME")]
+    sandbox_proxy_connect_by_hostname: Option<bool>,
+
+    /// User namespace mode for sandbox containers (e.g. `auto`).
+    /// When unset, containers use the default user namespace.
+    #[arg(long, env = "OPENSHELL_PODMAN_USERNS")]
+    userns: Option<String>,
+
+    /// Explicit UID mappings for `userns = "private"`.
+    /// Each entry is `"container_id:host_id:size"`.
+    #[arg(long = "uidmap")]
+    uidmap: Vec<String>,
+
+    /// Explicit GID mappings for `userns = "private"`.
+    /// Each entry is `"container_id:host_id:size"`.
+    #[arg(long = "gidmap")]
+    gidmap: Vec<String>,
 }
 
 #[tokio::main]
@@ -114,12 +159,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let socket_path = args
-        .podman_socket
-        .unwrap_or_else(PodmanComputeConfig::default_socket_path);
-
     let driver = PodmanComputeDriver::new(PodmanComputeConfig {
-        socket_path,
+        socket_path: args.podman_socket,
         default_image: args.sandbox_image.unwrap_or_default(),
         image_pull_policy: args.sandbox_image_pull_policy,
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
@@ -130,11 +171,22 @@ async fn main() -> Result<()> {
         sandbox_ssh_socket_path: args.sandbox_ssh_socket_path,
         network_name: args.network_name,
         stop_timeout_secs: args.stop_timeout,
-        supervisor_image: args.supervisor_image,
+        supervisor_image: args
+            .supervisor_image
+            .unwrap_or_else(openshell_core::config::default_supervisor_image),
         guest_tls_ca: args.podman_tls_ca,
         guest_tls_cert: args.podman_tls_cert,
         guest_tls_key: args.podman_tls_key,
         sandbox_pids_limit: args.sandbox_pids_limit,
+        https_proxy: args.sandbox_https_proxy,
+        no_proxy: args.sandbox_no_proxy,
+        proxy_auth_file: args.sandbox_proxy_auth_file,
+        proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
+        proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
+        userns: args.userns,
+        uidmap: args.uidmap,
+        gidmap: args.gidmap,
+        ..PodmanComputeConfig::default()
     })
     .await
     .into_diagnostic()?;

@@ -7,12 +7,12 @@ from __future__ import annotations
 
 from .sandbox import (
     ApproveAllResult,
-    ClusterInferenceConfig,
     DraftChunkRef,
     DraftPolicyResult,
     ExecChunk,
     ExecResult,
     InferenceRouteClient,
+    InferenceRouteConfig,
     PolicyUpdateResult,
     ProviderRef,
     Sandbox,
@@ -23,6 +23,8 @@ from .sandbox import (
     SandboxSession,
     SandboxStatusRef,
     TlsConfig,
+    WorkspaceClient,
+    WorkspaceRef,
 )
 
 try:
@@ -34,12 +36,12 @@ except Exception:
 
 __all__ = [
     "ApproveAllResult",
-    "ClusterInferenceConfig",
     "DraftChunkRef",
     "DraftPolicyResult",
     "ExecChunk",
     "ExecResult",
     "InferenceRouteClient",
+    "InferenceRouteConfig",
     "PolicyUpdateResult",
     "ProviderRef",
     "Sandbox",
@@ -50,5 +52,7 @@ __all__ = [
     "SandboxSession",
     "SandboxStatusRef",
     "TlsConfig",
+    "WorkspaceClient",
+    "WorkspaceRef",
     "__version__",
 ]

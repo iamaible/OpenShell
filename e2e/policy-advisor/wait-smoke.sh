@@ -57,7 +57,7 @@ if [[ -z "${OPENSHELL_BIN:-}" ]]; then
 fi
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
-SANDBOX="${SANDBOX:-policy-wait-smoke-${RUN_ID}}"
+SANDBOX="${SANDBOX:-pws-${RUN_ID}}"
 KEEP_SANDBOX="${KEEP_SANDBOX:-0}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-30}"
 
@@ -128,7 +128,6 @@ create_sandbox() {
         --name "$SANDBOX" \
         --upload "${RUNNER_SOURCE}:/sandbox/runner.sh" \
         --no-git-ignore \
-        --keep \
         --no-auto-providers \
         --no-tty \
         -- bash -lc "chmod +x /sandbox/runner.sh && echo sandbox ready" \

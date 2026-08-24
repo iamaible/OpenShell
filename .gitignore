@@ -5,6 +5,7 @@
 # Build output
 /target/
 e2e/rust/target/
+target/
 debug/
 release/
 
@@ -63,6 +64,8 @@ pip-log.txt
 pip-delete-this-directory.txt
 
 # Unit test / coverage reports
+coverage.out
+coverage/
 htmlcov/
 .tox/
 .nox/
@@ -133,6 +136,16 @@ tramp
 .\#*
 
 # =============================================================================
+# Agent tooling
+# =============================================================================
+
+# Local agent state and configuration
+.codex/
+.pi/
+.claude/settings.local.json
+.claude/worktrees/
+
+# =============================================================================
 # OS
 # =============================================================================
 
@@ -168,6 +181,7 @@ logs/
 tmp/
 temp/
 *.tmp
+e2e/gpu/images/.build/
 
 # Secrets/credentials (should never be committed)
 *.pem
@@ -199,15 +213,9 @@ artifacts/
 # Local mise settings
 mise.local.toml
 
-# Local Codex app state
-.codex/
-
 # Ignore plans for now
 architecture/plans
 
-# Claude
-.claude/settings.local.json
-.claude/worktrees/
 rfc.md
 .worktrees
 .z3-trace
@@ -224,3 +232,7 @@ rfc.md
 
 # Markdown/mermaid lint tooling deps
 scripts/lint-mermaid/node_modules/
+
+# Nix
+/result
+/result-*

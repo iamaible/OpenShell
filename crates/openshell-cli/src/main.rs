@@ -19,6 +19,7 @@ use openshell_bootstrap::{
 use openshell_cli::completers;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
+use openshell_core::proto::GpuResourceRequirements;
 
 /// Resolved gateway context: name + gateway endpoint.
 struct GatewayContext {
@@ -26,6 +27,21 @@ struct GatewayContext {
     name: String,
     /// The gateway endpoint URL (e.g., `https://127.0.0.1` or `https://10.0.0.5`).
     endpoint: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuCliRequest {
+    DriverDefault,
+    Count(u32),
+}
+
+impl From<GpuCliRequest> for GpuResourceRequirements {
+    fn from(gpu: GpuCliRequest) -> Self {
+        match gpu {
+            GpuCliRequest::Count(count) => Self { count: Some(count) },
+            GpuCliRequest::DriverDefault => Self { count: None },
+        }
+    }
 }
 
 /// Resolve the gateway name to a [`GatewayContext`] with the gateway endpoint.
@@ -109,6 +125,21 @@ fn resolve_gateway(
     })
 }
 
+fn parse_gpu_request(value: &str) -> std::result::Result<GpuCliRequest, String> {
+    if value.is_empty() {
+        return Ok(GpuCliRequest::DriverDefault);
+    }
+
+    let count = value
+        .parse::<u32>()
+        .map_err(|_| "GPU count must be a positive integer".to_string())?;
+    if count == 0 {
+        return Err("GPU count must be greater than 0".to_string());
+    }
+
+    Ok(GpuCliRequest::Count(count))
+}
+
 fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
     gateway_flag
         .clone()
@@ -126,19 +157,30 @@ fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
 /// and setting it on `TlsOptions`. For OIDC, automatically refreshes the token
 /// if it's near expiry.
 fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
-    let Some(meta) = get_gateway_metadata(gateway_name) else {
-        return;
-    };
+    let _ = apply_auth_with_status(tls, gateway_name);
+}
+
+/// Apply stored authentication and return a user-facing preparation failure,
+/// if the CLI already knows the credentials cannot be used.
+fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<String> {
+    let meta = get_gateway_metadata(gateway_name)?;
     match meta.auth_mode.as_deref() {
         Some("cloudflare_jwt") => {
             if let Some(token) = load_edge_token(gateway_name) {
                 tls.edge_token = Some(token);
+                None
+            } else {
+                Some(format!(
+                    "edge credentials are missing; run `openshell gateway login {gateway_name}`"
+                ))
             }
         }
         Some("oidc") => {
             let Some(bundle) = openshell_bootstrap::oidc_token::load_oidc_token(gateway_name)
             else {
-                return;
+                return Some(format!(
+                    "OIDC credentials are missing; run `openshell gateway login {gateway_name}`"
+                ));
             };
             if openshell_bootstrap::oidc_token::is_token_expired(&bundle) {
                 let insecure = std::env::var("OPENSHELL_GATEWAY_INSECURE")
@@ -147,7 +189,11 @@ fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
                 // so the async refresh can run within the sync apply_auth call.
                 match tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(
-                        openshell_cli::oidc_auth::oidc_refresh_token(&bundle, insecure),
+                        openshell_cli::oidc_auth::oidc_refresh_token(
+                            &bundle,
+                            meta.oidc_scopes.as_deref(),
+                            insecure,
+                        ),
                     )
                 }) {
                     Ok(refreshed) => {
@@ -156,32 +202,38 @@ fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
                             &refreshed,
                         );
                         tls.oidc_token = Some(refreshed.access_token);
+                        None
                     }
                     Err(e) => {
                         tracing::warn!("OIDC token refresh failed: {e}");
                         // Use the expired token anyway — server will reject it
                         // with a clear error prompting re-login.
                         tls.oidc_token = Some(bundle.access_token);
+                        Some(format!(
+                            "OIDC token refresh failed; run `openshell gateway login {gateway_name}`"
+                        ))
                     }
                 }
             } else {
                 tls.oidc_token = Some(bundle.access_token);
+                None
             }
         }
-        _ => {}
+        _ => None,
     }
 }
 
-/// Resolve a sandbox name, falling back to the last-used sandbox for the gateway.
+/// Resolve a sandbox name, falling back to the last-used sandbox for the
+/// gateway and workspace.
 ///
 /// When `name` is `None`, looks up the last sandbox recorded for the active
-/// gateway. Prints a hint when falling back so the user knows which sandbox
-/// was chosen.
-fn resolve_sandbox_name(name: Option<String>, gateway: &str) -> Result<String> {
+/// gateway and workspace. Prints a hint when falling back so the user knows
+/// which sandbox was chosen.
+fn resolve_sandbox_name(name: Option<String>, gateway: &str, workspace: &str) -> Result<String> {
     if let Some(n) = name {
         return Ok(n);
     }
-    let last = load_last_sandbox(gateway).ok_or_else(|| {
+    let last = load_last_sandbox(gateway, workspace).ok_or_else(|| {
         miette::miette!(
             "No sandbox name provided and no last-used sandbox.\n\
              Specify a sandbox name or connect to one first: openshell sandbox connect <name>"
@@ -209,8 +261,9 @@ const HELP_TEMPLATE: &str = "\
   provider:    Manage provider configuration
 
 \x1b[1mGATEWAY COMMANDS\x1b[0m
-  gateway:     Manage gateway registrations
+  gateway:     Manage gateways
   status:      Show gateway status and information
+  whoami:      Show the authenticated user identity
   inference:   Manage inference configuration
   doctor:      Diagnose gateway issues
 
@@ -329,6 +382,16 @@ const PROVIDER_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
   $ openshell provider delete openai
 ";
 
+const WORKSPACE_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
+  ws
+
+\x1b[1mEXAMPLES\x1b[0m
+  $ openshell workspace create --name staging
+  $ openshell workspace list
+  $ openshell workspace get staging
+  $ openshell workspace delete staging
+";
+
 const GATEWAY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   gw
 
@@ -390,6 +453,17 @@ struct Cli {
         help_heading = "GATEWAY FLAGS"
     )]
     gateway_insecure: bool,
+
+    /// Workspace scope for resource operations.
+    #[arg(
+        long,
+        global = true,
+        env = "OPENSHELL_WORKSPACE",
+        default_value = "default",
+        help_heading = "GLOBAL FLAGS",
+        add = ArgValueCompleter::new(completers::complete_workspace_names)
+    )]
+    workspace: String,
 
     /// Increase verbosity (-v, -vv, -vvv).
     #[arg(short, long, action = clap::ArgAction::Count, global = true, help_heading = "GLOBAL FLAGS")]
@@ -490,10 +564,17 @@ enum Commands {
         command: Option<ProviderCommands>,
     },
 
+    /// Manage workspaces.
+    #[command(alias = "ws", after_help = WORKSPACE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Workspace {
+        #[command(subcommand)]
+        command: Option<WorkspaceCommands>,
+    },
+
     // ===================================================================
     // GATEWAY COMMANDS
     // ===================================================================
-    /// Manage gateway registrations.
+    /// Manage gateways.
     #[command(alias = "gw", after_help = GATEWAY_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Gateway {
         #[command(subcommand)]
@@ -502,7 +583,19 @@ enum Commands {
 
     /// Show gateway status and information.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Status,
+    Status {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Show the identity validated by the gateway.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Whoami {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
 
     /// Manage inference configuration.
     #[command(after_help = INFERENCE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
@@ -661,6 +754,7 @@ enum CliProviderRefreshStrategy {
     Oauth2RefreshToken,
     Oauth2ClientCredentials,
     GoogleServiceAccountJwt,
+    AwsStsAssumeRole,
 }
 
 impl CliProviderRefreshStrategy {
@@ -669,6 +763,7 @@ impl CliProviderRefreshStrategy {
             Self::Oauth2RefreshToken => "oauth2_refresh_token",
             Self::Oauth2ClientCredentials => "oauth2_client_credentials",
             Self::GoogleServiceAccountJwt => "google_service_account_jwt",
+            Self::AwsStsAssumeRole => "aws_sts_assume_role",
         }
     }
 }
@@ -716,7 +811,7 @@ impl From<CliEditor> for openshell_cli::ssh::Editor {
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
-    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials", "from_gcloud_adc"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Provider name.
         #[arg(long)]
@@ -727,26 +822,35 @@ enum ProviderCommands {
         provider_type: String,
 
         /// Load provider credentials/config from existing local state.
-        #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc"])]
+        #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc", "runtime_credentials"])]
         from_existing: bool,
 
         /// Provider credential pair (`KEY=VALUE`) or env lookup key (`KEY`).
         #[arg(
             long = "credential",
             value_name = "KEY[=VALUE]",
-            conflicts_with_all = ["from_existing", "from_gcloud_adc"]
+            conflicts_with_all = ["from_existing", "from_gcloud_adc", "runtime_credentials"]
         )]
         credentials: Vec<String>,
 
         /// Configure credentials from gcloud Application Default Credentials
         /// (`~/.config/gcloud/application_default_credentials.json`).
-        /// Only valid for google-vertex-ai providers.
-        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials"])]
+        /// Valid for providers whose profile declares an ADC-compatible credential.
+        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials", "runtime_credentials"])]
         from_gcloud_adc: bool,
+
+        /// Create a provider whose required credentials are resolved at runtime by the gateway/sandbox.
+        #[arg(long, conflicts_with_all = ["from_existing", "credentials", "from_gcloud_adc"])]
+        runtime_credentials: bool,
 
         /// Provider config key/value pair.
         #[arg(long = "config", value_name = "KEY=VALUE")]
         config: Vec<String>,
+
+        /// Use a platform-scoped (global) provider profile instead of
+        /// a workspace-scoped one.
+        #[arg(long)]
+        global_profile: bool,
     },
 
     /// Manage provider credential refresh.
@@ -773,8 +877,16 @@ enum ProviderCommands {
         offset: u32,
 
         /// Print only provider names, one per line.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "output")]
         names: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with = "names")]
+        output: OutputFormat,
+
+        /// List providers across all workspaces (overrides --workspace).
+        #[arg(long)]
+        all_workspaces: bool,
     },
 
     /// List available provider profiles.
@@ -783,6 +895,10 @@ enum ProviderCommands {
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
         output: OutputFormat,
+
+        /// List platform-scoped profiles (ignores --workspace).
+        #[arg(long)]
+        global: bool,
     },
 
     /// Manage provider profiles.
@@ -859,6 +975,11 @@ enum ProviderRefreshCommands {
         #[arg(long = "material", value_name = "KEY=VALUE")]
         material: Vec<String>,
 
+        /// Secret refresh material resolved from the CLI environment
+        /// (`ENVVAR` defaults to `KEY`); `KEY` is auto-marked secret.
+        #[arg(long = "secret-material-env", value_name = "KEY[=ENVVAR]")]
+        secret_material_env: Vec<String>,
+
         /// Material keys that are secret and must not be exposed.
         #[arg(long = "secret-material-key", value_name = "KEY")]
         secret_material_keys: Vec<String>,
@@ -908,6 +1029,10 @@ enum ProviderProfileCommands {
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Yaml)]
         output: OutputFormat,
+
+        /// Target platform-scoped profiles (ignores --workspace).
+        #[arg(long)]
+        global: bool,
     },
 
     /// Import provider profiles from a file or directory.
@@ -920,6 +1045,25 @@ enum ProviderProfileCommands {
         /// Directory containing profile files to import.
         #[arg(long = "from", value_hint = ValueHint::DirPath)]
         from: Option<PathBuf>,
+
+        /// Import as platform-scoped profiles (ignores --workspace).
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Update an existing custom provider profile from a file.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Update {
+        /// Existing provider profile id to update.
+        id: String,
+
+        /// Profile file to update.
+        #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
+        file: PathBuf,
+
+        /// Target platform-scoped profile (ignores --workspace).
+        #[arg(long)]
+        global: bool,
     },
 
     /// Validate provider profile files without registering them.
@@ -932,6 +1076,10 @@ enum ProviderProfileCommands {
         /// Directory containing profile files to lint.
         #[arg(long = "from", value_hint = ValueHint::DirPath)]
         from: Option<PathBuf>,
+
+        /// Lint against platform scope (ignores --workspace).
+        #[arg(long)]
+        global: bool,
     },
 
     /// Delete a custom provider profile.
@@ -939,6 +1087,10 @@ enum ProviderProfileCommands {
     Delete {
         /// Provider profile id.
         id: String,
+
+        /// Target platform-scoped profile (ignores --workspace).
+        #[arg(long)]
+        global: bool,
     },
 }
 
@@ -1020,7 +1172,8 @@ enum GatewayCommands {
     /// Authenticate with an edge-authenticated or OIDC gateway.
     ///
     /// Opens a browser for the edge proxy's login flow and stores the
-    /// token locally. Use this to re-authenticate when a token expires.
+    /// token locally. After `gateway logout`, OIDC browser login requests a
+    /// fresh identity-provider prompt so you can switch users.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Login {
         /// Gateway name (defaults to the active gateway).
@@ -1031,7 +1184,9 @@ enum GatewayCommands {
     /// Clear stored authentication credentials for a gateway.
     ///
     /// Removes the locally stored OIDC token or edge token so subsequent
-    /// commands require re-authentication via `gateway login`.
+    /// commands require re-authentication via `gateway login`. For OIDC
+    /// gateways, the next browser login asks the identity provider for a fresh
+    /// login instead of silently reusing an existing browser session.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Logout {
         /// Gateway name (defaults to the active gateway).
@@ -1050,18 +1205,19 @@ enum GatewayCommands {
         name: Option<String>,
     },
 
-    /// Show gateway registration details.
+    /// Show elevated live gateway runtime information.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Info {
-        /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "OPENSHELL_GATEWAY", add = ArgValueCompleter::new(completers::complete_gateway_names))]
-        name: Option<String>,
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// List registered gateways.
     ///
-    /// Prints a table of all registered gateways with their endpoint, type,
-    /// and authentication mode. The active gateway is marked with `*`.
+    /// Prints all registered gateways with their endpoint, type,
+    /// authentication mode, source, and remote registration details.
+    /// The active gateway is marked with `*`.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List {
         /// Output format.
@@ -1076,7 +1232,7 @@ enum GatewayCommands {
 
 #[derive(Subcommand, Debug)]
 enum InferenceCommands {
-    /// Set gateway-level inference provider and model.
+    /// Set workspace-level inference provider and model.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Set {
         /// Provider name.
@@ -1102,7 +1258,7 @@ enum InferenceCommands {
         timeout: u64,
     },
 
-    /// Update gateway-level inference configuration (partial update).
+    /// Update workspace-level inference configuration (partial update).
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Update {
         /// Provider name (unchanged if omitted).
@@ -1126,11 +1282,19 @@ enum InferenceCommands {
         timeout: Option<u64>,
     },
 
-    /// Get gateway-level inference provider and model.
+    /// Get workspace-level inference provider and model.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Get {
         /// Show the system inference route instead of the user-facing route.
         /// When omitted, both routes are displayed.
+        #[arg(long)]
+        system: bool,
+    },
+
+    /// Delete a workspace-level inference route.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Delete the system inference route instead of the user-facing route.
         #[arg(long)]
         system: bool,
     },
@@ -1208,16 +1372,11 @@ enum SandboxCommands {
         editor: Option<CliEditor>,
 
         /// Request GPU resources for the sandbox.
-        /// GPU intent is also inferred automatically for known GPU-designated
-        /// image names such as `nvidia-gpu`.
-        #[arg(long)]
-        gpu: bool,
-
-        /// Target a driver-specific GPU device. Docker and Podman use CDI device IDs
-        /// (for example "nvidia.com/gpu=0"); VM uses a PCI BDF or index.
-        /// Only valid with --gpu. When omitted with --gpu, the driver uses its default GPU selection.
-        #[arg(long, requires = "gpu")]
-        gpu_device: Option<String>,
+        ///
+        /// Omit COUNT for the driver's default GPU selection, or pass COUNT
+        /// to request a specific number of GPUs.
+        #[arg(long, num_args = 0..=1, value_name = "COUNT", default_missing_value = "", value_parser = parse_gpu_request)]
+        gpu: Option<GpuCliRequest>,
 
         /// CPU limit for the sandbox (for example: 500m, 1, 2.5).
         #[arg(long)]
@@ -1227,7 +1386,17 @@ enum SandboxCommands {
         #[arg(long)]
         memory: Option<String>,
 
-        /// Provider names to attach to this sandbox.
+        /// Experimental driver-keyed JSON object for driver-specific sandbox settings.
+        /// Validation behavior is not yet finalized.
+        ///
+        /// For Kubernetes, pass a value such as
+        /// `{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}`.
+        #[arg(long, value_name = "JSON")]
+        driver_config_json: Option<String>,
+
+        /// Attach a configured credential provider to the sandbox.
+        /// Use providers for API keys, tokens, and other secrets so commands in
+        /// the sandbox do not receive the real credential values. Repeatable.
         #[arg(long = "provider")]
         providers: Vec<String>,
 
@@ -1267,6 +1436,16 @@ enum SandboxCommands {
         #[arg(long = "label")]
         labels: Vec<String>,
 
+        /// Set a non-secret environment variable in the sandbox.
+        /// Do not use this option for API keys, tokens, or other secrets; create
+        /// a provider and attach it with `--provider` instead. Repeatable.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        envs: Vec<String>,
+
+        /// Suppress warnings when --env values look like credentials.
+        #[arg(long = "no-credential-warnings")]
+        no_credential_warnings: bool,
+
         /// Approval mode for agent-authored policy proposals.
         ///
         /// `manual` (default): every proposal lands in the draft inbox for
@@ -1278,6 +1457,10 @@ enum SandboxCommands {
         /// default-deny posture is preserved unless you choose otherwise.
         #[arg(long, value_parser = ["manual", "auto"], default_value = "manual")]
         approval_mode: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with_all = ["editor", "command", "no_keep", "forward"])]
+        output: OutputFormat,
 
         /// Command to run after "--" (defaults to an interactive shell).
         #[arg(last = true, allow_hyphen_values = true)]
@@ -1292,8 +1475,12 @@ enum SandboxCommands {
         name: Option<String>,
 
         /// Print only the active policy YAML (same policy as the default view; stdout only).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "output")]
         policy_only: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// List sandboxes.
@@ -1322,6 +1509,10 @@ enum SandboxCommands {
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with_all = ["ids", "names"])]
         output: OutputFormat,
+
+        /// List sandboxes across all workspaces (overrides --workspace).
+        #[arg(long)]
+        all_workspaces: bool,
     },
 
     /// Delete a sandbox by name.
@@ -1334,6 +1525,22 @@ enum SandboxCommands {
         /// Delete all sandboxes.
         #[arg(long, conflicts_with = "names")]
         all: bool,
+    },
+
+    /// Stop a sandbox while preserving its workspace.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Stop {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
+    /// Start a stopped sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Start {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
     },
 
     /// Execute a command in a running sandbox.
@@ -1372,6 +1579,12 @@ enum SandboxCommands {
         /// Disable pseudo-terminal allocation.
         #[arg(long, overrides_with = "tty")]
         no_tty: bool,
+
+        /// Set a non-secret environment variable for the command.
+        /// Do not use this option for API keys, tokens, or other secrets; attach
+        /// a provider to the sandbox instead. Repeatable.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        envs: Vec<String>,
 
         /// Command and arguments to execute.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -1581,6 +1794,8 @@ enum PolicyCommands {
         name: Option<String>,
 
         /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement[:options]]]].
+        /// Options include allowed-ip=..., credential rewrite flags, and
+        /// allow-uninspected-credentials.
         #[arg(long = "add-endpoint")]
         add_endpoints: Vec<String>,
 
@@ -1632,9 +1847,13 @@ enum PolicyCommands {
         #[arg(long = "rev", default_value_t = 0)]
         rev: u32,
 
-        /// Include the full policy payload.
-        #[arg(long)]
+        /// Include the effective policy payload, including provider-composed entries.
+        #[arg(long, conflicts_with = "base")]
         full: bool,
+
+        /// Include the base policy payload without provider-composed entries.
+        #[arg(long)]
+        base: bool,
 
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = PolicyGetOutput::Table)]
@@ -1671,30 +1890,6 @@ enum PolicyCommands {
         /// Skip the confirmation prompt for global policy delete.
         #[arg(long)]
         yes: bool,
-    },
-
-    /// Prove properties of a sandbox policy — or find counterexamples.
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Prove {
-        /// Path to `OpenShell` sandbox policy YAML.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        policy: String,
-
-        /// Path to credential descriptor YAML.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        credentials: String,
-
-        /// Path to capability registry directory (default: bundled).
-        #[arg(long, value_hint = ValueHint::DirPath)]
-        registry: Option<String>,
-
-        /// Path to accepted risks YAML.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        accepted_risks: Option<String>,
-
-        /// One-line-per-finding output (for demos and CI).
-        #[arg(long)]
-        compact: bool,
     },
 }
 
@@ -1845,6 +2040,10 @@ enum ServiceCommands {
         /// Number of endpoints to skip.
         #[arg(long, default_value_t = 0)]
         offset: u32,
+
+        /// List services across all workspaces (overrides --workspace).
+        #[arg(long)]
+        all_workspaces: bool,
     },
 
     /// Show one exposed sandbox service endpoint.
@@ -1870,9 +2069,136 @@ enum ServiceCommands {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum WorkspaceCommands {
+    /// Create a workspace.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Create {
+        /// Workspace name (DNS-1123 label: lowercase alphanumeric and hyphens, max 19 chars).
+        #[arg(long)]
+        name: String,
+
+        /// Labels to attach to the workspace (KEY=VALUE).
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
+    },
+
+    /// Fetch a workspace by name.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Workspace name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_workspace_names))]
+        name: String,
+    },
+
+    /// List workspaces.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Maximum number of workspaces to return.
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+
+        /// Offset into the workspace list.
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+
+        /// Filter by label selector (e.g. "env=staging").
+        #[arg(long)]
+        label_selector: Option<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
+
+    /// Delete a workspace.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Workspace name(s) to delete.
+        #[arg(required = true, add = ArgValueCompleter::new(completers::complete_workspace_names))]
+        names: Vec<String>,
+    },
+
+    /// Manage workspace members.
+    #[command(subcommand, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Member(WorkspaceMemberCommands),
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkspaceMemberCommands {
+    /// Add a member to a workspace.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Add {
+        /// Workspace name.
+        #[arg(long, add = ArgValueCompleter::new(completers::complete_workspace_names))]
+        workspace: String,
+
+        /// OIDC subject claim identifying the principal.
+        #[arg(long)]
+        subject: String,
+
+        /// Role to assign (user or admin).
+        #[arg(long)]
+        role: String,
+    },
+
+    /// Remove a member from a workspace.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Remove {
+        /// Workspace name.
+        #[arg(long, add = ArgValueCompleter::new(completers::complete_workspace_names))]
+        workspace: String,
+
+        /// OIDC subject claim identifying the principal.
+        #[arg(long)]
+        subject: String,
+    },
+
+    /// List members of a workspace.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Workspace name.
+        #[arg(long, add = ArgValueCompleter::new(completers::complete_workspace_names))]
+        workspace: String,
+
+        /// Maximum number of members to return.
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+
+        /// Offset into the member list.
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+    },
+}
+
+#[cfg(target_os = "windows")]
+fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .name("openshell-main".to_string())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(run_main)
+        .map_err(|err| miette::miette!("failed to start OpenShell main thread: {err}"))?
+        .join()
+        .map_err(|_| miette::miette!("OpenShell main thread panicked"))?
+}
+
+#[cfg(not(target_os = "windows"))]
 #[tokio::main]
-#[allow(clippy::large_stack_frames)] // CLI dispatch holds many futures; OK at top level.
 async fn main() -> Result<()> {
+    run_async().await
+}
+
+#[cfg(target_os = "windows")]
+fn run_main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| miette::miette!("failed to build Tokio runtime: {err}"))?
+        .block_on(run_async())
+}
+
+#[allow(clippy::large_stack_frames)] // CLI dispatch holds many futures; run on an expanded Windows stack.
+async fn run_async() -> Result<()> {
     // Install the rustls crypto provider before completion runs — completers may
     // establish TLS connections to the gateway.
     rustls::crypto::ring::default_provider()
@@ -1986,11 +2312,14 @@ async fn main() -> Result<()> {
             GatewayCommands::Select { name } => {
                 run::gateway_select(name.as_deref(), &cli.gateway)?;
             }
-            GatewayCommands::Info { name } => {
-                let name = name
-                    .or_else(|| resolve_gateway_name(&cli.gateway))
-                    .unwrap_or_else(|| "openshell".to_string());
-                run::gateway_admin_info(&name)?;
+            GatewayCommands::Info { output } => {
+                if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+                    let mut tls = tls.with_gateway_name(&ctx.name);
+                    apply_auth(&mut tls, &ctx.name);
+                    run::gateway_info(&ctx.name, &ctx.endpoint, &tls, output.as_str()).await?;
+                } else {
+                    run::gateway_info_not_configured()?;
+                }
             }
             GatewayCommands::List { output } => {
                 run::gateway_list(&cli.gateway, output.as_str())?;
@@ -2018,11 +2347,24 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------
         // Top-level status
         // -----------------------------------------------------------
-        Some(Commands::Status) => {
+        Some(Commands::Status { output }) => {
             if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
                 let mut tls = tls.with_gateway_name(&ctx.name);
-                apply_auth(&mut tls, &ctx.name);
-                run::gateway_status(&ctx.name, &ctx.endpoint, &tls).await?;
+                let auth_error = apply_auth_with_status(&mut tls, &ctx.name);
+                run::gateway_status(
+                    &ctx.name,
+                    &ctx.endpoint,
+                    output.as_str(),
+                    &tls,
+                    auth_error.as_deref(),
+                )
+                .await?;
+            } else if openshell_cli::output::print_output_single(
+                output.as_str(),
+                &(),
+                |()| serde_json::json!({"status": "not_configured"}),
+            )? {
+                // Structured output handled.
             } else {
                 println!("{}", "Gateway Status".cyan().bold());
                 println!();
@@ -2033,6 +2375,16 @@ async fn main() -> Result<()> {
                     "openshell gateway add <endpoint>".dimmed()
                 );
             }
+        }
+
+        // -----------------------------------------------------------
+        // Top-level current identity
+        // -----------------------------------------------------------
+        Some(Commands::Whoami { output }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name);
+            run::whoami(&ctx.endpoint, &tls, output.as_str()).await?;
         }
 
         // -----------------------------------------------------------
@@ -2073,7 +2425,7 @@ async fn main() -> Result<()> {
                 } else {
                     let name_width = forwards
                         .iter()
-                        .map(|f| f.sandbox.len())
+                        .map(|f| f.sandbox_name.len())
                         .max()
                         .unwrap_or(7)
                         .max(7);
@@ -2093,14 +2445,14 @@ async fn main() -> Result<()> {
                         bw = bind_width,
                     );
                     for f in &forwards {
-                        let status = if f.alive {
+                        let status = if f.validated_alive {
                             "running".green().to_string()
                         } else {
                             "dead".red().to_string()
                         };
                         println!(
                             "{:<nw$} {:<bw$} {:<8} {:<10} {}",
-                            f.sandbox,
+                            f.sandbox_name,
                             f.bind_addr,
                             f.port,
                             f.pid,
@@ -2120,7 +2472,7 @@ async fn main() -> Result<()> {
                 let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 apply_auth(&mut tls, &ctx.name);
-                let name = resolve_sandbox_name(name, &ctx.name)?;
+                let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                 let local = local.unwrap_or_else(|| target_port.to_string());
                 run::service_forward_tcp(
                     &ctx.endpoint,
@@ -2129,6 +2481,7 @@ async fn main() -> Result<()> {
                     &target_host,
                     target_port,
                     &tls,
+                    &cli.workspace,
                 )
                 .await?;
             }
@@ -2141,8 +2494,16 @@ async fn main() -> Result<()> {
                 let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 apply_auth(&mut tls, &ctx.name);
-                let name = resolve_sandbox_name(name, &ctx.name)?;
-                run::sandbox_forward(&ctx.endpoint, &name, &spec, background, &tls).await?;
+                let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                run::sandbox_forward(
+                    &ctx.endpoint,
+                    &name,
+                    &spec,
+                    background,
+                    &tls,
+                    &cli.workspace,
+                )
+                .await?;
                 if background {
                     eprintln!(
                         "{} Forwarding port {} to sandbox {name} in the background",
@@ -2171,24 +2532,42 @@ async fn main() -> Result<()> {
                     target_port,
                 } => {
                     let service = service.unwrap_or_default();
-                    run::service_expose(&ctx.endpoint, &sandbox, &service, target_port, &tls)
-                        .await?;
+                    run::service_expose(
+                        &ctx.endpoint,
+                        &sandbox,
+                        &service,
+                        target_port,
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
                 }
                 ServiceCommands::List {
                     sandbox,
                     limit,
                     offset,
+                    all_workspaces,
                 } => {
-                    run::service_list(&ctx.endpoint, sandbox.as_deref(), limit, offset, &tls)
-                        .await?;
+                    run::service_list(
+                        &ctx.endpoint,
+                        sandbox.as_deref(),
+                        limit,
+                        offset,
+                        &cli.workspace,
+                        all_workspaces,
+                        &tls,
+                    )
+                    .await?;
                 }
                 ServiceCommands::Get { sandbox, service } => {
                     let service = service.unwrap_or_default();
-                    run::service_get(&ctx.endpoint, &sandbox, &service, &tls).await?;
+                    run::service_get(&ctx.endpoint, &sandbox, &service, &cli.workspace, &tls)
+                        .await?;
                 }
                 ServiceCommands::Delete { sandbox, service } => {
                     let service = service.unwrap_or_default();
-                    run::service_delete(&ctx.endpoint, &sandbox, &service, &tls).await?;
+                    run::service_delete(&ctx.endpoint, &sandbox, &service, &cli.workspace, &tls)
+                        .await?;
                 }
             }
         }
@@ -2206,7 +2585,7 @@ async fn main() -> Result<()> {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name);
-            let name = resolve_sandbox_name(name, &ctx.name)?;
+            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
             run::sandbox_logs(
                 &ctx.endpoint,
                 &name,
@@ -2215,6 +2594,7 @@ async fn main() -> Result<()> {
                 since.as_deref(),
                 &source,
                 &level,
+                &cli.workspace,
                 &tls,
             )
             .await?;
@@ -2223,28 +2603,6 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------
         // Top-level policy (was `sandbox policy`)
         // -----------------------------------------------------------
-        Some(Commands::Policy {
-            command:
-                Some(PolicyCommands::Prove {
-                    policy,
-                    credentials,
-                    registry,
-                    accepted_risks,
-                    compact,
-                }),
-        }) => {
-            // Prove runs locally — no gateway needed.
-            let exit_code = openshell_prover::prove(
-                &policy,
-                &credentials,
-                registry.as_deref(),
-                accepted_risks.as_deref(),
-                compact,
-            )?;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-        }
         Some(Commands::Policy {
             command: Some(policy_cmd),
         }) => {
@@ -2273,13 +2631,22 @@ async fn main() -> Result<()> {
                             yes,
                             wait,
                             timeout,
+                            &cli.workspace,
                             &tls,
                         )
                         .await?;
                     } else {
-                        let name = resolve_sandbox_name(name, &ctx.name)?;
-                        run::sandbox_policy_set(&ctx.endpoint, &name, &policy, wait, timeout, &tls)
-                            .await?;
+                        let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                        run::sandbox_policy_set(
+                            &ctx.endpoint,
+                            &name,
+                            &policy,
+                            wait,
+                            timeout,
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
                     }
                 }
                 PolicyCommands::Update {
@@ -2295,7 +2662,7 @@ async fn main() -> Result<()> {
                     wait,
                     timeout,
                 } => {
-                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                     run::sandbox_policy_update(
                         &ctx.endpoint,
                         &name,
@@ -2309,6 +2676,7 @@ async fn main() -> Result<()> {
                         dry_run,
                         wait,
                         timeout,
+                        &cli.workspace,
                         &tls,
                     )
                     .await?;
@@ -2317,26 +2685,30 @@ async fn main() -> Result<()> {
                     name,
                     rev,
                     full,
+                    base,
                     output,
                     global,
                 } => {
+                    let view = run::PolicyGetView::from_flags(base, full);
                     if global {
                         run::sandbox_policy_get_global(
                             &ctx.endpoint,
                             rev,
-                            full,
+                            view,
                             output.as_str(),
+                            &cli.workspace,
                             &tls,
                         )
                         .await?;
                     } else {
-                        let name = resolve_sandbox_name(name, &ctx.name)?;
+                        let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                         run::sandbox_policy_get(
                             &ctx.endpoint,
                             &name,
                             rev,
-                            full,
+                            view,
                             output.as_str(),
+                            &cli.workspace,
                             &tls,
                         )
                         .await?;
@@ -2348,10 +2720,12 @@ async fn main() -> Result<()> {
                     global,
                 } => {
                     if global {
-                        run::sandbox_policy_list_global(&ctx.endpoint, limit, &tls).await?;
+                        run::sandbox_policy_list_global(&ctx.endpoint, limit, &cli.workspace, &tls)
+                            .await?;
                     } else {
-                        let name = resolve_sandbox_name(name, &ctx.name)?;
-                        run::sandbox_policy_list(&ctx.endpoint, &name, limit, &tls).await?;
+                        let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                        run::sandbox_policy_list(&ctx.endpoint, &name, limit, &cli.workspace, &tls)
+                            .await?;
                     }
                 }
                 PolicyCommands::Delete { global, yes } => {
@@ -2360,9 +2734,9 @@ async fn main() -> Result<()> {
                             "sandbox policy delete is not supported; use --global to remove global policy lock"
                         ));
                     }
-                    run::gateway_setting_delete(&ctx.endpoint, "policy", yes, &tls).await?;
+                    run::gateway_setting_delete(&ctx.endpoint, "policy", yes, &cli.workspace, &tls)
+                        .await?;
                 }
-                PolicyCommands::Prove { .. } => unreachable!(),
             }
         }
 
@@ -2386,8 +2760,9 @@ async fn main() -> Result<()> {
                         }
                         run::gateway_settings_get(&ctx.endpoint, json, &tls).await?;
                     } else {
-                        let name = resolve_sandbox_name(name, &ctx.name)?;
-                        run::sandbox_settings_get(&ctx.endpoint, &name, json, &tls).await?;
+                        let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                        run::sandbox_settings_get(&ctx.endpoint, &name, json, &cli.workspace, &tls)
+                            .await?;
                     }
                 }
                 SettingsCommands::Set {
@@ -2398,10 +2773,26 @@ async fn main() -> Result<()> {
                     yes,
                 } => {
                     if global {
-                        run::gateway_setting_set(&ctx.endpoint, &key, &value, yes, &tls).await?;
+                        run::gateway_setting_set(
+                            &ctx.endpoint,
+                            &key,
+                            &value,
+                            yes,
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
                     } else {
-                        let name = resolve_sandbox_name(name, &ctx.name)?;
-                        run::sandbox_setting_set(&ctx.endpoint, &name, &key, &value, &tls).await?;
+                        let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                        run::sandbox_setting_set(
+                            &ctx.endpoint,
+                            &name,
+                            &key,
+                            &value,
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
                     }
                 }
                 SettingsCommands::Delete {
@@ -2411,10 +2802,18 @@ async fn main() -> Result<()> {
                     yes,
                 } => {
                     if global {
-                        run::gateway_setting_delete(&ctx.endpoint, &key, yes, &tls).await?;
+                        run::gateway_setting_delete(&ctx.endpoint, &key, yes, &cli.workspace, &tls)
+                            .await?;
                     } else {
-                        let name = resolve_sandbox_name(name, &ctx.name)?;
-                        run::sandbox_setting_delete(&ctx.endpoint, &name, &key, &tls).await?;
+                        let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                        run::sandbox_setting_delete(
+                            &ctx.endpoint,
+                            &name,
+                            &key,
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -2431,43 +2830,65 @@ async fn main() -> Result<()> {
             apply_auth(&mut tls, &ctx.name);
             match draft_cmd {
                 DraftCommands::Get { name, status } => {
-                    let name = resolve_sandbox_name(name, &ctx.name)?;
-                    run::sandbox_draft_get(&ctx.endpoint, &name, status.as_deref(), &tls).await?;
+                    let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                    run::sandbox_draft_get(
+                        &ctx.endpoint,
+                        &name,
+                        status.as_deref(),
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
                 }
                 DraftCommands::Approve { name, chunk_id } => {
-                    let name = resolve_sandbox_name(name, &ctx.name)?;
-                    run::sandbox_draft_approve(&ctx.endpoint, &name, &chunk_id, &tls).await?;
+                    let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                    run::sandbox_draft_approve(
+                        &ctx.endpoint,
+                        &name,
+                        &chunk_id,
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
                 }
                 DraftCommands::Reject {
                     name,
                     chunk_id,
                     reason,
                 } => {
-                    let name = resolve_sandbox_name(name, &ctx.name)?;
-                    run::sandbox_draft_reject(&ctx.endpoint, &name, &chunk_id, &reason, &tls)
-                        .await?;
+                    let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                    run::sandbox_draft_reject(
+                        &ctx.endpoint,
+                        &name,
+                        &chunk_id,
+                        &reason,
+                        &cli.workspace,
+                        &tls,
+                    )
+                    .await?;
                 }
                 DraftCommands::ApproveAll {
                     name,
                     include_security_flagged,
                 } => {
-                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                     run::sandbox_draft_approve_all(
                         &ctx.endpoint,
                         &name,
                         include_security_flagged,
+                        &cli.workspace,
                         &tls,
                     )
                     .await?;
                 }
 
                 DraftCommands::Clear { name } => {
-                    let name = resolve_sandbox_name(name, &ctx.name)?;
-                    run::sandbox_draft_clear(&ctx.endpoint, &name, &tls).await?;
+                    let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                    run::sandbox_draft_clear(&ctx.endpoint, &name, &cli.workspace, &tls).await?;
                 }
                 DraftCommands::History { name } => {
-                    let name = resolve_sandbox_name(name, &ctx.name)?;
-                    run::sandbox_draft_history(&ctx.endpoint, &name, &tls).await?;
+                    let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                    run::sandbox_draft_history(&ctx.endpoint, &name, &cli.workspace, &tls).await?;
                 }
             }
         }
@@ -2492,7 +2913,14 @@ async fn main() -> Result<()> {
                 } => {
                     let route_name = if system { "sandbox-system" } else { "" };
                     run::gateway_inference_set(
-                        endpoint, &provider, &model, route_name, no_verify, timeout, &tls,
+                        endpoint,
+                        &provider,
+                        &model,
+                        route_name,
+                        no_verify,
+                        timeout,
+                        &cli.workspace,
+                        &tls,
                     )
                     .await?;
                 }
@@ -2511,13 +2939,19 @@ async fn main() -> Result<()> {
                         route_name,
                         no_verify,
                         timeout,
+                        &cli.workspace,
                         &tls,
                     )
                     .await?;
                 }
                 InferenceCommands::Get { system } => {
                     let route_name = if system { Some("sandbox-system") } else { None };
-                    run::gateway_inference_get(endpoint, route_name, &tls).await?;
+                    run::gateway_inference_get(endpoint, route_name, &cli.workspace, &tls).await?;
+                }
+                InferenceCommands::Delete { system } => {
+                    let route_name = if system { "sandbox-system" } else { "" };
+                    run::gateway_inference_delete(endpoint, route_name, &cli.workspace, &tls)
+                        .await?;
                 }
             }
         }
@@ -2538,9 +2972,9 @@ async fn main() -> Result<()> {
                     no_keep,
                     editor,
                     gpu,
-                    gpu_device,
                     cpu,
                     memory,
+                    driver_config_json,
                     providers,
                     policy,
                     forward,
@@ -2549,7 +2983,10 @@ async fn main() -> Result<()> {
                     auto_providers,
                     no_auto_providers,
                     labels,
+                    envs,
+                    no_credential_warnings,
                     approval_mode,
+                    output,
                     command,
                 } => {
                     // Resolve --tty / --no-tty into an Option<bool> override.
@@ -2583,6 +3020,10 @@ async fn main() -> Result<()> {
                         labels_map.insert(parts[0].to_string(), parts[1].to_string());
                     }
 
+                    // Parse --env flags into a HashMap<String, String>.
+                    let env_map = run::parse_env_pairs(&envs)?;
+                    run::warn_credential_env_vars(&env_map, no_credential_warnings);
+
                     // Parse --upload specs into [(local_path, sandbox_path, git_ignore)].
                     let upload_specs: Vec<(String, Option<String>, bool)> = upload
                         .iter()
@@ -2605,6 +3046,7 @@ async fn main() -> Result<()> {
                         .map(|s| openshell_core::forward::ForwardSpec::parse(&s))
                         .transpose()?;
                     let keep = keep || !no_keep || editor.is_some() || forward.is_some();
+                    let gpu_requirements: Option<GpuResourceRequirements> = gpu.map(Into::into);
 
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
@@ -2612,24 +3054,29 @@ async fn main() -> Result<()> {
                     apply_auth(&mut tls, &ctx.name);
                     Box::pin(run::sandbox_create(
                         endpoint,
-                        name.as_deref(),
-                        from.as_deref(),
                         &ctx.name,
-                        &upload_specs,
-                        keep,
-                        gpu,
-                        gpu_device.as_deref(),
-                        cpu.as_deref(),
-                        memory.as_deref(),
-                        editor,
-                        &providers,
-                        policy.as_deref(),
-                        forward,
-                        &command,
-                        tty_override,
-                        auto_providers_override,
-                        &labels_map,
-                        &approval_mode,
+                        run::SandboxCreateConfig {
+                            name: name.as_deref(),
+                            from: from.as_deref(),
+                            uploads: &upload_specs,
+                            keep,
+                            gpu_requirements,
+                            cpu: cpu.as_deref(),
+                            memory: memory.as_deref(),
+                            driver_config_json: driver_config_json.as_deref(),
+                            editor,
+                            providers: &providers,
+                            policy: policy.as_deref(),
+                            forward,
+                            command: &command,
+                            tty_override,
+                            auto_providers_override,
+                            labels: labels_map,
+                            environment: env_map,
+                            approval_mode: &approval_mode,
+                            output: output.as_str(),
+                        },
+                        &cli.workspace,
                         &tls,
                     ))
                     .await?;
@@ -2643,33 +3090,17 @@ async fn main() -> Result<()> {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name);
-                    let sandbox_dest = dest.as_deref();
                     let local = std::path::Path::new(&local_path);
-                    if !local.exists() {
-                        return Err(miette::miette!(
-                            "local path does not exist: {}",
-                            local.display()
-                        ));
-                    }
-                    let dest_display = sandbox_dest.unwrap_or("~");
-                    eprintln!("Uploading {} -> sandbox:{}", local.display(), dest_display);
-                    if !no_git_ignore && let Ok((base_dir, files)) = run::git_sync_files(local) {
-                        run::sandbox_sync_up_files(
-                            &ctx.endpoint,
-                            &name,
-                            &base_dir,
-                            &files,
-                            local,
-                            sandbox_dest,
-                            &tls,
-                        )
-                        .await?;
-                        eprintln!("{} Upload complete", "✓".green().bold());
-                        return Ok(());
-                    }
-                    // Fallback: upload without git filtering
-                    run::sandbox_sync_up(&ctx.endpoint, &name, local, sandbox_dest, &tls).await?;
-                    eprintln!("{} Upload complete", "✓".green().bold());
+                    run::sandbox_upload(
+                        &ctx.endpoint,
+                        &name,
+                        local,
+                        dest.as_deref(),
+                        !no_git_ignore,
+                        &tls,
+                        &cli.workspace,
+                    )
+                    .await?;
                 }
                 SandboxCommands::Download {
                     name,
@@ -2681,8 +3112,15 @@ async fn main() -> Result<()> {
                     apply_auth(&mut tls, &ctx.name);
                     let local_dest = dest.as_deref().unwrap_or(".");
                     eprintln!("Downloading sandbox:{sandbox_path} -> {local_dest}");
-                    run::sandbox_sync_down(&ctx.endpoint, &name, &sandbox_path, local_dest, &tls)
-                        .await?;
+                    run::sandbox_sync_down(
+                        &ctx.endpoint,
+                        &name,
+                        &sandbox_path,
+                        local_dest,
+                        &tls,
+                        &cli.workspace,
+                    )
+                    .await?;
                     eprintln!("{} Download complete", "✓".green().bold());
                 }
                 other => {
@@ -2696,9 +3134,21 @@ async fn main() -> Result<()> {
                         | SandboxCommands::Download { .. } => {
                             unreachable!()
                         }
-                        SandboxCommands::Get { name, policy_only } => {
-                            let name = resolve_sandbox_name(name, &ctx.name)?;
-                            run::sandbox_get(endpoint, &name, policy_only, &tls).await?;
+                        SandboxCommands::Get {
+                            name,
+                            policy_only,
+                            output,
+                        } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_get(
+                                endpoint,
+                                &name,
+                                policy_only,
+                                output.as_str(),
+                                &cli.workspace,
+                                &tls,
+                            )
+                            .await?;
                         }
                         SandboxCommands::List {
                             limit,
@@ -2707,6 +3157,7 @@ async fn main() -> Result<()> {
                             names,
                             selector,
                             output,
+                            all_workspaces,
                         } => {
                             run::sandbox_list(
                                 endpoint,
@@ -2716,24 +3167,47 @@ async fn main() -> Result<()> {
                                 names,
                                 selector.as_deref(),
                                 output.as_str(),
+                                &cli.workspace,
+                                all_workspaces,
                                 &tls,
                             )
                             .await?;
                         }
                         SandboxCommands::Delete { names, all } => {
-                            run::sandbox_delete(endpoint, &names, all, &tls, &ctx.name).await?;
+                            run::sandbox_delete(
+                                endpoint,
+                                &names,
+                                all,
+                                &cli.workspace,
+                                &tls,
+                                &ctx.name,
+                            )
+                            .await?;
+                        }
+                        SandboxCommands::Stop { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_stop(endpoint, &name, &cli.workspace, &tls).await?;
+                        }
+                        SandboxCommands::Start { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::sandbox_start(endpoint, &name, &cli.workspace, &tls).await?;
                         }
                         SandboxCommands::Connect { name, editor } => {
-                            let name = resolve_sandbox_name(name, &ctx.name)?;
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                             if let Some(editor) = editor.map(Into::into) {
                                 run::sandbox_connect_editor(
-                                    endpoint, &ctx.name, &name, editor, &tls,
+                                    endpoint,
+                                    &ctx.name,
+                                    &name,
+                                    editor,
+                                    &tls,
+                                    &cli.workspace,
                                 )
                                 .await?;
                             } else {
-                                run::sandbox_connect(endpoint, &name, &tls).await?;
+                                run::sandbox_connect(endpoint, &name, &tls, &cli.workspace).await?;
                             }
-                            let _ = save_last_sandbox(&ctx.name, &name);
+                            let _ = save_last_sandbox(&ctx.name, &cli.workspace, &name);
                         }
                         SandboxCommands::Exec {
                             name,
@@ -2741,9 +3215,10 @@ async fn main() -> Result<()> {
                             timeout,
                             tty,
                             no_tty,
+                            envs,
                             command,
                         } => {
-                            let name = resolve_sandbox_name(name, &ctx.name)?;
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
                             // Resolve --tty / --no-tty into an Option<bool> override.
                             let tty_override = if no_tty {
                                 Some(false)
@@ -2752,6 +3227,7 @@ async fn main() -> Result<()> {
                             } else {
                                 None // auto-detect
                             };
+                            let env_map = run::parse_env_pairs(&envs)?;
                             let exit_code = run::sandbox_exec_grpc(
                                 endpoint,
                                 &name,
@@ -2759,36 +3235,113 @@ async fn main() -> Result<()> {
                                 workdir.as_deref(),
                                 timeout,
                                 tty_override,
+                                &env_map,
                                 &tls,
+                                &cli.workspace,
                             )
                             .await?;
-                            let _ = save_last_sandbox(&ctx.name, &name);
+                            let _ = save_last_sandbox(&ctx.name, &cli.workspace, &name);
                             if exit_code != 0 {
                                 std::process::exit(exit_code);
                             }
                         }
                         SandboxCommands::SshConfig { name } => {
-                            let name = resolve_sandbox_name(name, &ctx.name)?;
-                            run::print_ssh_config(&ctx.name, &name);
+                            let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                            run::print_ssh_config(&ctx.name, &name, &cli.workspace);
                         }
                         SandboxCommands::Provider(command) => match command {
                             SandboxProviderCommands::List { name } => {
-                                let name = resolve_sandbox_name(name, &ctx.name)?;
-                                run::sandbox_provider_list(endpoint, &name, &tls).await?;
+                                let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
+                                run::sandbox_provider_list(endpoint, &name, &cli.workspace, &tls)
+                                    .await?;
                             }
                             SandboxProviderCommands::Attach { name, provider } => {
-                                run::sandbox_provider_attach(endpoint, &name, &provider, &tls)
-                                    .await?;
+                                run::sandbox_provider_attach(
+                                    endpoint,
+                                    &name,
+                                    &provider,
+                                    &cli.workspace,
+                                    &tls,
+                                )
+                                .await?;
                             }
                             SandboxProviderCommands::Detach { name, provider } => {
-                                run::sandbox_provider_detach(endpoint, &name, &provider, &tls)
-                                    .await?;
+                                run::sandbox_provider_detach(
+                                    endpoint,
+                                    &name,
+                                    &provider,
+                                    &cli.workspace,
+                                    &tls,
+                                )
+                                .await?;
                             }
                         },
                     }
                 }
             }
         }
+
+        // -----------------------------------------------------------
+        // Workspace commands
+        // -----------------------------------------------------------
+        Some(Commands::Workspace {
+            command: Some(command),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let endpoint = &ctx.endpoint;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name);
+
+            match command {
+                WorkspaceCommands::Create { name, labels } => {
+                    run::workspace_create(endpoint, &name, &labels, &tls).await?;
+                }
+                WorkspaceCommands::Get { name } => {
+                    run::workspace_get(endpoint, &name, &tls).await?;
+                }
+                WorkspaceCommands::List {
+                    limit,
+                    offset,
+                    label_selector,
+                    output,
+                } => {
+                    run::workspace_list(
+                        endpoint,
+                        limit,
+                        offset,
+                        label_selector.as_deref().unwrap_or(""),
+                        output.as_str(),
+                        &tls,
+                    )
+                    .await?;
+                }
+                WorkspaceCommands::Delete { names } => {
+                    run::workspace_delete(endpoint, &names, &tls).await?;
+                }
+                WorkspaceCommands::Member(command) => match command {
+                    WorkspaceMemberCommands::Add {
+                        workspace,
+                        subject,
+                        role,
+                    } => {
+                        run::workspace_member_add(endpoint, &workspace, &subject, &role, &tls)
+                            .await?;
+                    }
+                    WorkspaceMemberCommands::Remove { workspace, subject } => {
+                        run::workspace_member_remove(endpoint, &workspace, &subject, &tls).await?;
+                    }
+                    WorkspaceMemberCommands::List {
+                        workspace,
+                        limit,
+                        offset,
+                    } => {
+                        run::workspace_member_list(endpoint, &workspace, limit, offset, &tls)
+                            .await?;
+                    }
+                },
+            }
+        }
+
         Some(Commands::Provider {
             command: Some(command),
         }) => {
@@ -2804,16 +3357,22 @@ async fn main() -> Result<()> {
                     from_existing,
                     credentials,
                     from_gcloud_adc,
+                    runtime_credentials,
                     config,
+                    global_profile,
                 } => {
-                    run::provider_create(
+                    let profile_ws = if global_profile { "" } else { &cli.workspace };
+                    run::provider_create_with_options(
                         endpoint,
                         &name,
                         provider_type.as_str(),
                         from_existing,
                         &credentials,
                         from_gcloud_adc,
+                        runtime_credentials,
                         &config,
+                        &cli.workspace,
+                        profile_ws,
                         &tls,
                     )
                     .await?;
@@ -2827,6 +3386,7 @@ async fn main() -> Result<()> {
                             endpoint,
                             &name,
                             credential_key.as_deref(),
+                            &cli.workspace,
                             &tls,
                         )
                         .await?;
@@ -2836,6 +3396,7 @@ async fn main() -> Result<()> {
                         credential_key,
                         strategy,
                         material,
+                        secret_material_env,
                         secret_material_keys,
                         credential_expires_at,
                     } => {
@@ -2846,9 +3407,11 @@ async fn main() -> Result<()> {
                                 credential_key: &credential_key,
                                 strategy: strategy.as_str(),
                                 material: &material,
+                                secret_material_env: &secret_material_env,
                                 secret_material_keys: &secret_material_keys,
                                 credential_expires_at_ms: credential_expires_at,
                             },
+                            &cli.workspace,
                             &tls,
                         )
                         .await?;
@@ -2857,55 +3420,110 @@ async fn main() -> Result<()> {
                         name,
                         credential_key,
                     } => {
-                        run::provider_rotate(endpoint, &name, &credential_key, &tls).await?;
+                        run::provider_rotate(
+                            endpoint,
+                            &name,
+                            &credential_key,
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
                     }
                     ProviderRefreshCommands::Delete {
                         name,
                         credential_key,
                     } => {
-                        run::provider_refresh_delete(endpoint, &name, &credential_key, &tls)
-                            .await?;
+                        run::provider_refresh_delete(
+                            endpoint,
+                            &name,
+                            &credential_key,
+                            &cli.workspace,
+                            &tls,
+                        )
+                        .await?;
                     }
                 },
                 ProviderCommands::Get { name } => {
-                    run::provider_get(endpoint, &name, &tls).await?;
+                    run::provider_get(endpoint, &name, &cli.workspace, &tls).await?;
                 }
                 ProviderCommands::List {
                     limit,
                     offset,
                     names,
+                    output,
+                    all_workspaces,
                 } => {
-                    run::provider_list(endpoint, limit, offset, names, &tls).await?;
+                    run::provider_list(
+                        endpoint,
+                        limit,
+                        offset,
+                        names,
+                        output.as_str(),
+                        &cli.workspace,
+                        all_workspaces,
+                        &tls,
+                    )
+                    .await?;
                 }
-                ProviderCommands::ListProfiles { output } => {
-                    run::provider_list_profiles(endpoint, output.as_str(), &tls).await?;
+                ProviderCommands::ListProfiles { output, global } => {
+                    let ws = if global { "" } else { &cli.workspace };
+                    run::provider_list_profiles(endpoint, output.as_str(), ws, &tls).await?;
                 }
-                ProviderCommands::Profile(command) => match command {
-                    ProviderProfileCommands::Export { id, output } => {
-                        run::provider_profile_export(endpoint, &id, output.as_str(), &tls).await?;
+                ProviderCommands::Profile(command) => {
+                    let profile_workspace =
+                        |global: bool| -> &str { if global { "" } else { &cli.workspace } };
+                    match command {
+                        ProviderProfileCommands::Export { id, output, global } => {
+                            run::provider_profile_export(
+                                endpoint,
+                                &id,
+                                output.as_str(),
+                                profile_workspace(global),
+                                &tls,
+                            )
+                            .await?;
+                        }
+                        ProviderProfileCommands::Import { file, from, global } => {
+                            run::provider_profile_import(
+                                endpoint,
+                                file.as_deref(),
+                                from.as_deref(),
+                                profile_workspace(global),
+                                &tls,
+                            )
+                            .await?;
+                        }
+                        ProviderProfileCommands::Update { id, file, global } => {
+                            run::provider_profile_update(
+                                endpoint,
+                                &id,
+                                &file,
+                                profile_workspace(global),
+                                &tls,
+                            )
+                            .await?;
+                        }
+                        ProviderProfileCommands::Lint { file, from, global } => {
+                            run::provider_profile_lint(
+                                endpoint,
+                                file.as_deref(),
+                                from.as_deref(),
+                                profile_workspace(global),
+                                &tls,
+                            )
+                            .await?;
+                        }
+                        ProviderProfileCommands::Delete { id, global } => {
+                            run::provider_profile_delete(
+                                endpoint,
+                                &id,
+                                profile_workspace(global),
+                                &tls,
+                            )
+                            .await?;
+                        }
                     }
-                    ProviderProfileCommands::Import { file, from } => {
-                        run::provider_profile_import(
-                            endpoint,
-                            file.as_deref(),
-                            from.as_deref(),
-                            &tls,
-                        )
-                        .await?;
-                    }
-                    ProviderProfileCommands::Lint { file, from } => {
-                        run::provider_profile_lint(
-                            endpoint,
-                            file.as_deref(),
-                            from.as_deref(),
-                            &tls,
-                        )
-                        .await?;
-                    }
-                    ProviderProfileCommands::Delete { id } => {
-                        run::provider_profile_delete(endpoint, &id, &tls).await?;
-                    }
-                },
+                }
                 ProviderCommands::Update {
                     name,
                     from_existing,
@@ -2920,12 +3538,13 @@ async fn main() -> Result<()> {
                         &credentials,
                         &config,
                         &credential_expires_at,
+                        &cli.workspace,
                         &tls,
                     )
                     .await?;
                 }
                 ProviderCommands::Delete { names } => {
-                    run::provider_delete(endpoint, &names, &tls).await?;
+                    run::provider_delete(endpoint, &names, &cli.workspace, &tls).await?;
                 }
             }
         }
@@ -2938,7 +3557,15 @@ async fn main() -> Result<()> {
                 tls.oidc_token.as_deref(),
                 tls.edge_token.as_deref(),
             )?;
-            openshell_tui::run(channel, interceptor, &ctx.name, &ctx.endpoint, theme).await?;
+            openshell_tui::run(
+                channel,
+                interceptor,
+                &ctx.name,
+                &ctx.endpoint,
+                &cli.workspace,
+                theme,
+            )
+            .await?;
         }
         Some(Commands::Completions { shell }) => {
             let exe = std::env::current_exe()
@@ -2988,11 +3615,11 @@ async fn main() -> Result<()> {
                     };
                     let mut tls = tls.with_gateway_name(&g);
                     apply_auth(&mut tls, &g);
-                    run::sandbox_ssh_proxy_by_name(&endpoint, &n, &tls).await?;
+                    run::sandbox_ssh_proxy_by_name(&endpoint, &n, &tls, &cli.workspace).await?;
                 }
                 // Legacy name mode with --server only (no --gateway-name).
                 (_, _, _, Some(srv), None, Some(n)) => {
-                    run::sandbox_ssh_proxy_by_name(&srv, &n, &tls).await?;
+                    run::sandbox_ssh_proxy_by_name(&srv, &n, &tls, &cli.workspace).await?;
                 }
                 _ => {
                     return Err(miette::miette!(
@@ -3035,6 +3662,13 @@ async fn main() -> Result<()> {
             Cli::command()
                 .find_subcommand_mut("settings")
                 .expect("settings subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Workspace { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("workspace")
+                .expect("workspace subcommand exists")
                 .print_help()
                 .expect("Failed to print help");
         }
@@ -3347,7 +3981,7 @@ mod tests {
             for (raw_args, index) in [
                 (vec!["openshell", "--gateway", "a"], 2),
                 (vec!["openshell", "gateway", "select", "a"], 3),
-                (vec!["openshell", "gateway", "info", "--name", "a"], 4),
+                (vec!["openshell", "gateway", "remove", "a"], 3),
             ] {
                 let mut cmd = Cli::command();
                 let args: Vec<OsString> = raw_args.iter().copied().map(Into::into).collect();
@@ -3372,7 +4006,40 @@ mod tests {
             .expect("global gateway flag should parse with subcommands");
 
         assert_eq!(cli.gateway.as_deref(), Some("demo"));
-        assert!(matches!(cli.command, Some(Commands::Status)));
+        assert!(matches!(cli.command, Some(Commands::Status { .. })));
+    }
+
+    #[test]
+    fn whoami_accepts_output_json() {
+        let cli = Cli::try_parse_from(["openshell", "whoami", "--output", "json"])
+            .expect("whoami --output json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Whoami {
+                output: OutputFormat::Json
+            })
+        ));
+    }
+
+    #[test]
+    fn gateway_info_accepts_output_json() {
+        let cli = Cli::try_parse_from(["openshell", "gateway", "info", "-o", "json"])
+            .expect("gateway info -o json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Gateway {
+                command: Some(GatewayCommands::Info {
+                    output: OutputFormat::Json
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn top_level_info_is_not_a_command() {
+        assert!(Cli::try_parse_from(["openshell", "info"]).is_err());
     }
 
     #[test]
@@ -3536,7 +4203,7 @@ mod tests {
     fn resolve_sandbox_name_returns_explicit_name() {
         // When a name is provided, it should be returned regardless of any
         // stored last-sandbox state.
-        let result = resolve_sandbox_name(Some("explicit".to_string()), "any-gateway");
+        let result = resolve_sandbox_name(Some("explicit".to_string()), "any-gateway", "default");
         assert_eq!(result.unwrap(), "explicit");
     }
 
@@ -3544,8 +4211,8 @@ mod tests {
     fn resolve_sandbox_name_falls_back_to_last_used() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            save_last_sandbox("test-gateway", "remembered-sb").unwrap();
-            let result = resolve_sandbox_name(None, "test-gateway");
+            save_last_sandbox("test-gateway", "default", "remembered-sb").unwrap();
+            let result = resolve_sandbox_name(None, "test-gateway", "default");
             assert_eq!(result.unwrap(), "remembered-sb");
         });
     }
@@ -3554,7 +4221,7 @@ mod tests {
     fn resolve_sandbox_name_errors_without_fallback() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            let err = resolve_sandbox_name(None, "unknown-gateway").unwrap_err();
+            let err = resolve_sandbox_name(None, "unknown-gateway", "default").unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("openshell sandbox connect"),
@@ -3601,6 +4268,27 @@ mod tests {
     }
 
     #[test]
+    fn gpu_cli_request_option_maps_absent_gpu_to_no_requirements() {
+        let gpu: Option<GpuResourceRequirements> = Option::<GpuCliRequest>::None.map(Into::into);
+
+        assert_eq!(gpu, None);
+    }
+
+    #[test]
+    fn gpu_cli_request_driver_default_converts_to_requirements() {
+        let gpu = GpuResourceRequirements::from(GpuCliRequest::DriverDefault);
+
+        assert_eq!(gpu.count, None);
+    }
+
+    #[test]
+    fn gpu_cli_request_count_converts_to_requirements() {
+        let gpu = GpuResourceRequirements::from(GpuCliRequest::Count(2));
+
+        assert_eq!(gpu.count, Some(2));
+    }
+
+    #[test]
     fn apply_auth_uses_stored_token() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
@@ -3615,6 +4303,25 @@ mod tests {
             apply_auth(&mut tls, "edge-gateway");
 
             assert_eq!(tls.edge_token.as_deref(), Some("token-123"));
+        });
+    }
+
+    #[test]
+    fn apply_auth_reports_missing_edge_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            store_gateway_metadata(
+                "edge-gateway",
+                &edge_metadata("edge-gateway", "https://gw.example.com"),
+            )
+            .unwrap();
+
+            let mut tls = TlsOptions::default();
+            let error = apply_auth_with_status(&mut tls, "edge-gateway")
+                .expect("missing credentials should be reported");
+
+            assert!(error.contains("edge credentials are missing"));
+            assert!(!tls.is_bearer_auth());
         });
     }
 
@@ -3669,7 +4376,8 @@ mod tests {
             cli.command,
             Some(Commands::Provider {
                 command: Some(ProviderCommands::ListProfiles {
-                    output: OutputFormat::Table
+                    output: OutputFormat::Table,
+                    global: false,
                 })
             })
         ));
@@ -3684,7 +4392,8 @@ mod tests {
             cli.command,
             Some(Commands::Provider {
                 command: Some(ProviderCommands::ListProfiles {
-                    output: OutputFormat::Json
+                    output: OutputFormat::Json,
+                    global: false,
                 })
             })
         ));
@@ -3707,7 +4416,8 @@ mod tests {
             Some(Commands::Provider {
                 command: Some(ProviderCommands::Profile(ProviderProfileCommands::Export {
                     id,
-                    output: OutputFormat::Yaml
+                    output: OutputFormat::Yaml,
+                    ..
                 }))
             }) if id == "custom-api"
         ));
@@ -3731,6 +4441,27 @@ mod tests {
             })
         ));
 
+        let update = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "profile",
+            "update",
+            "custom-api",
+            "-f",
+            "./profiles/custom-api.yaml",
+        ])
+        .expect("provider profile update should parse");
+        assert!(matches!(
+            update.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Profile(ProviderProfileCommands::Update {
+                    id,
+                    file: _,
+                    ..
+                }))
+            }) if id == "custom-api"
+        ));
+
         let delete =
             Cli::try_parse_from(["openshell", "provider", "profile", "delete", "custom-api"])
                 .expect("provider profile delete should parse");
@@ -3738,7 +4469,8 @@ mod tests {
             delete.command,
             Some(Commands::Provider {
                 command: Some(ProviderCommands::Profile(ProviderProfileCommands::Delete {
-                    id
+                    id,
+                    ..
                 }))
             }) if id == "custom-api"
         ));
@@ -3756,6 +4488,27 @@ mod tests {
                     output: OutputFormat::Table,
                     ..
                 })
+            })
+        ));
+    }
+
+    #[test]
+    fn sandbox_stop_and_start_accept_optional_names() {
+        let stop = Cli::try_parse_from(["openshell", "sandbox", "stop", "demo"])
+            .expect("stop command should parse");
+        assert!(matches!(
+            stop.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Stop { name: Some(ref name) }),
+            }) if name == "demo"
+        ));
+
+        let start = Cli::try_parse_from(["openshell", "sandbox", "start"])
+            .expect("start command should parse");
+        assert!(matches!(
+            start.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Start { name: None }),
             })
         ));
     }
@@ -3850,6 +4603,52 @@ mod tests {
     }
 
     #[test]
+    fn provider_list_accepts_output_json() {
+        let cli = Cli::try_parse_from(["openshell", "provider", "list", "-o", "json"])
+            .expect("provider list -o json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::List {
+                    output: OutputFormat::Json,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_list_accepts_output_yaml() {
+        let cli = Cli::try_parse_from(["openshell", "provider", "list", "-o", "yaml"])
+            .expect("provider list -o yaml should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::List {
+                    output: OutputFormat::Yaml,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn provider_list_output_conflicts_with_names() {
+        let result =
+            Cli::try_parse_from(["openshell", "provider", "list", "-o", "json", "--names"]);
+        assert!(result.is_err(), "--names and -o should conflict");
+    }
+
+    #[test]
+    fn provider_list_names_conflicts_with_output() {
+        let result =
+            Cli::try_parse_from(["openshell", "provider", "list", "--names", "-o", "yaml"]);
+        assert!(result.is_err(), "--names and -o should conflict");
+    }
+
+    #[test]
     fn provider_create_accepts_custom_profile_type_ids() {
         let cli = Cli::try_parse_from([
             "openshell",
@@ -3877,6 +4676,60 @@ mod tests {
                 assert_eq!(name, "work-github");
                 assert_eq!(provider_type, "github-readonly");
                 assert_eq!(credentials, vec!["GITHUB_TOKEN=token"]);
+            }
+            other => panic!("expected provider create command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_create_requires_credential_source() {
+        let err = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "create",
+            "--name",
+            "spiffe-token-demo",
+            "--type",
+            "spiffe-token-demo",
+        ])
+        .expect_err("provider create should require a credential source");
+
+        assert!(err.to_string().contains("--runtime-credentials"));
+    }
+
+    #[test]
+    fn provider_create_accepts_runtime_credentials() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "create",
+            "--name",
+            "spiffe-token-demo",
+            "--type",
+            "spiffe-token-demo",
+            "--runtime-credentials",
+        ])
+        .expect("provider create should parse runtime credentials");
+
+        match cli.command {
+            Some(Commands::Provider {
+                command:
+                    Some(ProviderCommands::Create {
+                        name,
+                        provider_type,
+                        from_existing,
+                        credentials,
+                        from_gcloud_adc,
+                        runtime_credentials,
+                        ..
+                    }),
+            }) => {
+                assert_eq!(name, "spiffe-token-demo");
+                assert_eq!(provider_type, "spiffe-token-demo");
+                assert!(!from_existing);
+                assert!(credentials.is_empty());
+                assert!(!from_gcloud_adc);
+                assert!(runtime_credentials);
             }
             other => panic!("expected provider create command, got: {other:?}"),
         }
@@ -3957,6 +4810,8 @@ mod tests {
             "oauth2-client-credentials",
             "--material",
             "tenant_id=abc",
+            "--secret-material-env",
+            "client_secret=GRAPH_CLIENT_SECRET",
             "--secret-material-key",
             "client_secret",
             "--credential-expires-at",
@@ -3970,10 +4825,11 @@ mod tests {
                     ProviderRefreshCommands::Configure {
                         strategy: CliProviderRefreshStrategy::Oauth2ClientCredentials,
                         credential_expires_at: Some(1_767_225_600_000),
+                        ref secret_material_env,
                         ..
                     }
                 ))
-            })
+            }) if secret_material_env == &["client_secret=GRAPH_CLIENT_SECRET".to_string()]
         ));
 
         let rotate = Cli::try_parse_from([
@@ -4140,12 +4996,37 @@ mod tests {
             Some(Commands::Policy {
                 command:
                     Some(PolicyCommands::Get {
-                        name, full, output, ..
+                        name,
+                        full,
+                        base,
+                        output,
+                        ..
                     }),
             }) => {
                 assert_eq!(name.as_deref(), Some("my-sandbox"));
                 assert!(full);
+                assert!(!base);
                 assert!(matches!(output, PolicyGetOutput::Json));
+            }
+            other => panic!("expected policy get command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_get_base_output_parses() {
+        let cli = Cli::try_parse_from(["openshell", "policy", "get", "my-sandbox", "--base"])
+            .expect("policy get --base should parse");
+
+        match cli.command {
+            Some(Commands::Policy {
+                command:
+                    Some(PolicyCommands::Get {
+                        name, full, base, ..
+                    }),
+            }) => {
+                assert_eq!(name.as_deref(), Some("my-sandbox"));
+                assert!(!full);
+                assert!(base);
             }
             other => panic!("expected policy get command, got: {other:?}"),
         }
@@ -4302,6 +5183,25 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_create_output_conflicts_with_side_effect_args() {
+        for (label, extra_args) in [
+            ("--editor", &["--editor", "code"][..]),
+            ("trailing command", &["--", "claude"][..]),
+            ("--no-keep", &["--no-keep"][..]),
+            ("--forward", &["--forward", "8080"][..]),
+        ] {
+            let args = ["openshell", "sandbox", "create", "--output", "json"]
+                .into_iter()
+                .chain(extra_args.iter().copied());
+            let result = Cli::try_parse_from(args);
+            assert!(
+                result.is_err(),
+                "structured output should conflict with {label}"
+            );
+        }
+    }
+
+    #[test]
     fn sandbox_create_resource_flags_parse() {
         let cli = Cli::try_parse_from([
             "openshell",
@@ -4333,6 +5233,139 @@ mod tests {
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn sandbox_create_driver_config_json_flag_parses() {
+        let json = r#"{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}"#;
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--driver-config-json",
+            json,
+        ])
+        .expect("sandbox create driver config JSON flag should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        driver_config_json, ..
+                    }),
+                ..
+            }) => {
+                assert_eq!(driver_config_json.as_deref(), Some(json));
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_parses_driver_default() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu"])
+            .expect("sandbox create --gpu should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::DriverDefault));
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_parses_from_gpu_flag() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu", "2"])
+            .expect("sandbox create --gpu 2 should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::Count(2)));
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_driver_default_allows_trailing_command() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu", "--", "claude"])
+            .expect("sandbox create --gpu -- claude should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, command, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::DriverDefault));
+                assert_eq!(command, vec!["claude".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_allows_trailing_command() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--gpu",
+            "2",
+            "--",
+            "claude",
+        ])
+        .expect("sandbox create --gpu 2 -- claude should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, command, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::Count(2)));
+                assert_eq!(command, vec!["claude".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_rejects_zero() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu", "0"]);
+
+        assert!(result.is_err(), "sandbox create --gpu 0 should be rejected");
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_accepts_equals_syntax() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu=2"])
+            .expect("sandbox create --gpu=2 should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::Count(2)));
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_rejects_non_integer() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu", "many"]);
+
+        assert!(
+            result.is_err(),
+            "sandbox create --gpu many should be rejected"
+        );
     }
 
     #[test]
@@ -4429,6 +5462,7 @@ mod tests {
                         sandbox,
                         limit,
                         offset,
+                        ..
                     }),
             }) => {
                 assert_eq!(sandbox.as_deref(), Some("my-sandbox"));
@@ -4448,6 +5482,7 @@ mod tests {
                         sandbox,
                         limit,
                         offset,
+                        ..
                     }),
             }) => {
                 assert_eq!(sandbox, None);

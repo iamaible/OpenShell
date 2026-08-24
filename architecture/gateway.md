@@ -37,6 +37,135 @@ health, metrics, or tunnel routes. The plaintext service router also rejects
 browser requests whose Fetch Metadata, Origin, or Referer headers indicate a
 cross-origin or sibling-subdomain request.
 
+Docker and Podman report the local address through which their sandboxes can
+reach the gateway. When the primary listener covers that address, the gateway
+reuses it; sandbox JWT authentication and its RPC allowlist remain the callback
+authorization boundary. When the primary listener does not cover the address,
+the gateway adds a callback-only listener. Additional callback listeners accept
+only gRPC methods classified as sandbox-callable by the gateway's generated
+authorization metadata. They reject user and administrator APIs, health,
+reflection, non-callback inference APIs, and HTTP routes before normal request
+authentication. The operator-configured primary listener retains the full
+multiplexed API surface.
+
+The `rpc_auth` classification is also the source of truth for negotiated
+listener exposure: marking an RPC as `sandbox` or `dual` makes it callable on
+these listeners. Review such changes as both authorization and network-surface
+changes. Listener requirements are currently authorized only for the built-in
+Docker and Podman drivers. Operator-granted listener capabilities for external
+drivers are tracked in
+[#2539](https://github.com/NVIDIA/OpenShell/issues/2539).
+
+Operators can configure a gateway-wide gRPC request rate limit. The limit is
+applied only to gRPC API traffic after protocol multiplexing; health, metrics,
+and local sandbox-service HTTP routes are not rate limited by this control.
+
+Gateway interceptors run in one middleware layer on the `openshell.v1.OpenShell`
+gRPC service after authentication and before tonic dispatches to individual
+handlers. At startup the gateway calls each configured interceptor's `Describe`
+RPC, validates declared bindings against the compiled OpenShell descriptor set,
+and builds an immutable execution plan. Only unary OpenShell methods in the
+gateway's explicit interceptable-method allowlist are decoded through the
+descriptor set into protobuf JSON, evaluated through configured phases, and
+re-encoded before the handler sees the request. New RPCs are non-interceptable
+until deliberately added to this allowlist. Interception remains centralized:
+allowlisting a unary RPC does not require method-specific gateway
+instrumentation.
+
+Remote extension clients share `openshell-extension-core` transport and bearer
+primitives. When gateway JWT signing is configured, the gateway mints
+short-lived, exact-audience EdDSA credentials for middleware and interceptors,
+rotates their in-memory slots without rebuilding clients, and publishes the
+public verification key at `/.well-known/jwks.json` alongside OIDC-shaped
+discovery metadata at `/.well-known/openid-configuration`. HTTPS extensions can
+pin an operator-provided CA while retaining endpoint-hostname verification.
+
+Extension credentials reuse the sandbox signing key and are separated from
+sandbox-to-gateway admission tokens by exact audience and by an explicit
+`typ` of `openshell-ext+jwt`, so a verifier that checks either one alone
+cannot confuse the two. After authenticated `Describe` succeeds, a service may
+advertise `expected_audience` as a post-authentication consistency assertion;
+a mismatch against operator configuration fails gateway startup. A strict
+verifier may reject an incorrect audience before returning the manifest. A
+registration may opt out of extension authentication entirely with
+`allow_insecure_transport`, which permits a plaintext endpoint, attaches no
+credential, and warns at every startup. Credential minting is bounded per
+sandbox because it resolves the caller's effective policy.
+
+Each configured interceptor selects a binding policy. `dynamic` accepts valid
+manifest declarations and preserves the compatibility behavior. `allowlist`
+enables only operator-configured RPCs and phases, while `exact` requires the
+configured and declared sets to match. Strict policies match by RPC rather than
+manifest binding ID, so renaming a binding does not change authority. Provider
+profile sources remain a separate operator-controlled capability.
+
+The protobuf schema marks dedicated credential, token, and refresh-material
+fields with a custom secret option. The middleware recursively omits those
+fields from every request and post-commit response sent to an interceptor while
+retaining the complete protobuf operation for handler dispatch. JSON Patch
+paths and source paths cannot select an omitted field or replace a containing
+object. There is no configuration that exposes annotated fields.
+
+`SubmitPolicyAnalysis` is interceptable because proposed chunks can eventually
+change active policy through the gateway's approval workflow. An interceptor
+may therefore reject policy proposals while permitting telemetry-only requests.
+Gateways without a matching binding retain the standard proposal behavior.
+
+The descriptor codec uses protobuf's standard `oneof` semantics. If binary
+input contains multiple alternatives from one group, the last member on the
+wire wins. The middleware converts that selected value to ProtoJSON and
+re-encodes it before dispatch, so the interceptor and handler observe the same
+canonical request. ProtoJSON input that names multiple alternatives remains
+invalid.
+
+Modification results are atomic per binding. After applying one binding's full
+JSON Patch list, the middleware re-encodes the candidate as the request's
+protobuf type and decodes those accepted bytes back to canonical ProtoJSON.
+Invalid candidates follow that binding's failure policy: fail-open restores the
+exact pre-binding operation, while fail-closed rejects the request before
+handler dispatch. Later bindings only observe the same schema-valid operation
+that the handler will receive; protobuf map entry ordering is not treated as a
+semantic difference.
+
+Each interceptor evaluation selects exactly one phase payload:
+`modify_operation`, `validate`, or `post_commit`. Modification and validation
+payloads carry the protobuf JSON operation entering that phase. Post-commit
+payloads carry the successful committed response instead of echoing the
+request. Only the `validate` payload can also carry optional read-only
+`current_state`; modification and post-commit evaluations never receive it. The
+gateway does not yet load method-specific state, so the field remains absent;
+an absent state is distinct from an explicitly empty object. Method-specific
+state schemas and persistence-version binding are deferred until a concrete
+consumer requires them.
+
+Post-commit evaluation is strictly observational. A binding that includes
+`post_commit` must resolve to `fail_open`, or interceptor initialization fails.
+After a handler returns success, failures never replace the committed response.
+Binding failures emit the standard fail-open warning and counter; response
+observation or evaluation failures outside binding policy emit warnings and the
+`openshell_gateway_interceptor_post_commit_observation_failures_total` metric.
+The gateway reconstructs the original response frames, including trailers and
+body errors, before evaluating the observer.
+
+Interceptor manifests can also vend provider profile catalogs. Gateway
+configuration selects the exact ordered source set from the in-tree built-in
+source, the stored user source, and named profile-capable interceptors. Omitting
+the setting selects `builtin + user`; selecting only an interceptor makes it
+authoritative by omission. Every selected source uses the same snapshot,
+semantic-validation, and duplicate-detection path. Duplicate normalized profile
+IDs fail instead of creating source precedence. The gateway treats configured
+interceptors as trusted sources and does not verify signature annotations in
+their profile payloads.
+
+Each logical gateway request captures the selected sources into one validated,
+immutable effective catalog before deriving provider behavior. Policy layers,
+credential scope, injected environment material, dynamic token grants, and
+provider-environment revisions use that same catalog. Each configured source is
+therefore fetched at most once per request, and a source revision change becomes
+visible on the next request instead of partway through the current request. The
+capture emits debug diagnostics with the combined catalog revision, source fetch
+count, and profile count; it never logs provider credentials or profile material.
+
 Supported auth modes:
 
 | Mode | Use |
@@ -45,11 +174,37 @@ Supported auth modes:
 | Plaintext | Local development or a trusted reverse proxy boundary. |
 | Unauthenticated local users | Trusted Kubernetes dev or fully trusted proxy deployments only. |
 | Cloudflare JWT | Edge-authenticated deployments where Cloudflare Access supplies identity. |
-| OIDC | Bearer-token auth for users, with browser PKCE or client credentials login. |
+| OIDC | Bearer-token auth for users, with browser or device-code PKCE and client credentials login. |
 
-Sandbox supervisor RPCs authenticate with gateway-minted sandbox JWTs when that
-authenticator is configured; mTLS does not grant sandbox identity. User-facing
-mutations are authorized by role policy when OIDC or edge identity is enabled.
+The CLI persists the scopes requested during OIDC login in gateway metadata and
+reuses them when refreshing an access token. This preserves the intended API
+resource selection for identity providers that bind access-token audiences to
+OAuth scopes.
+
+Gateway health and user authentication are separate probes. `OpenShell.Health`
+remains unauthenticated so deployment and load-balancer health checks do not
+depend on user credentials. The CLI uses the existing, side-effect-free
+`OpenShell.GetGatewayInfo` capability query as its protected authentication
+probe. `Unauthenticated` means the credentials were rejected, while
+`PermissionDenied` proves authentication succeeded before the caller failed
+the capability query's admin authorization check. The CLI combines the health
+and capability results so a reachable gateway with an expired or rejected
+token is reported as connected but unauthenticated.
+
+Sandbox supervisor RPCs authenticate with explicit sandbox credentials; mTLS
+does not grant sandbox identity. Kubernetes deployments use the
+gateway-minted JWT bootstrap path: the supervisor starts with a projected
+ServiceAccount token, exchanges it for a gateway-minted sandbox JWT, and uses
+that JWT on subsequent gateway RPCs.
+User-facing RPCs are authorized by descriptor-declared role and scope policy
+when OIDC or edge identity is enabled. The OIDC admin role grants platform-wide
+access and bypasses workspace membership checks. Workspace Admin and Workspace
+User roles are durable membership records keyed by workspace and authenticated
+subject. Handlers resolve the resource workspace and require sufficient
+membership after the middleware validates the global role and optional scope.
+The authenticated `GetCurrentUser` endpoint exposes the gateway's validated
+user subject, display name, roles, scopes, and identity provider for CLI
+identity inspection without client-side token decoding.
 
 Sandbox secrets are gateway-signed JWTs bound to a single sandbox ID. Docker,
 Podman, and VM drivers deliver the initial token through supervisor-only
@@ -58,10 +213,13 @@ token through `IssueSandboxToken`. The gateway validates that projected token
 with Kubernetes `TokenReview`, requires the configured sandbox service account,
 checks the returned pod binding against the live pod UID, and verifies the pod's
 controlling `Sandbox` ownerReference against the live Sandbox CR UID and
-sandbox-id label before minting the gateway JWT. Supervisors renew gateway JWTs
-in memory before expiry only while the sandbox record still exists. Older tokens
-are not server-revoked; shared deployments bound replay exposure with short
-`gateway_jwt.ttl_secs` lifetimes. The config default is
+sandbox-id label before minting the gateway JWT. The bootstrap path accepts
+both `agents.x-k8s.io/v1beta1` ownerReferences from newer Agent Sandbox
+controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing
+deployments. Supervisors renew gateway JWTs in memory before expiry only while
+the sandbox record still exists. Older tokens are not server-revoked; shared
+deployments bound replay exposure with short `gateway_jwt.ttl_secs` lifetimes.
+The config default is
 `gateway_jwt.ttl_secs = 0` for local single-player Docker, Podman, and VM
 gateways; those tokens carry `exp = 0` and do not expire. Kubernetes and other
 shared deployments should set a positive TTL.
@@ -132,6 +290,15 @@ populate `scope`, `version`, `status`, `dedup_key`, and `hit_count` so the
 gateway can efficiently fetch the latest policy, track load status, and manage
 advisor drafts without creating resource-specific tables.
 
+Each sandbox policy revision stores the complete provenance annotation map
+supplied with that update. The revision payload is the authoritative immutable
+record; sandbox metadata receives the same annotations only as a convenience
+projection and can retain keys from earlier revisions. Policy revision creation,
+optional first-policy backfill, metadata projection, and superseding older
+revisions commit in one database transaction. SQLite serializes this operation
+with an immediate transaction, while Postgres locks the sandbox row. A failed
+resource-version check or revision insert rolls back the entire operation.
+
 SQLite is the default local store; Postgres is supported for deployments that
 need an external database or multi-replica coordination. Both backends expose
 the same `Store` API and the same logical schema. Backend differences stay
@@ -150,10 +317,28 @@ default WAL journal mode), which mirror the same sensitive contents.
 
 Persisted state includes sandboxes, providers, provider credential refresh
 state, SSH sessions, policy revisions, settings, inference configuration, and
-deployment records. Provider refresh material is stored as a separate object
-scoped to the provider instance through `objects.scope`; the provider record
-keeps only the current injectable credential values and optional per-credential
-expiry timestamps.
+deployment records. Provider refresh state is stored as a separate object
+scoped to the provider instance through `objects.scope`. Its non-secret
+configuration remains inline, while refresh tokens, client secrets, private
+keys, and other secret source material are stored through the active credential
+driver and represented by opaque handles. The provider record keeps only the
+current injectable credential handles and optional per-credential expiry
+timestamps. A refresh normally mints one credential, but a strategy may
+co-mint several (AWS STS mints the access key, secret key, and session token in
+one call); the refresh state pins the resolved set of env keys it owns so
+collision checks reserve all of them before the first mint. Provider records
+keep inline credential values only for legacy records created before credential
+driver storage. New provider and refresh-material writes keep driver-owned
+credential handles. When no external credential driver is configured, gateways
+use server-owned encrypted database credential storage for defense in depth.
+Multi-replica deployments can use that default with a shared database and
+shared key-encryption key, or opt into an external backend such as Vault or
+Kubernetes Secrets.
+
+Credential handles remain bound to the driver that created them. Before the
+0.1.0 compatibility boundary, gateways do not migrate inline refresh material
+or move handles between credential drivers; operators reconfigure affected
+grants when upgrading or changing backends.
 
 ### Optimistic Concurrency (CAS)
 
@@ -208,7 +393,8 @@ modes:
   mutation. If they diverge it returns `Conflict` without attempting the
   write. Client-facing operations that carry an `expected_resource_version`
   field use this mode: `AttachSandboxProvider`, `DetachSandboxProvider`,
-  `UpdateProvider`, and `UpdateConfig` (policy backfill path).
+  `UpdateProvider`, `UpdateProviderProfiles`, and `UpdateConfig` (policy
+  backfill and sandbox annotation updates).
 
 **Lists.** The `list_messages` and `list_messages_with_selector` helpers decode
 protobuf payloads from list results and hydrate `resource_version` from the
@@ -227,7 +413,7 @@ coverage:
 |---|---|---|---|
 | Sandbox | `MustCreate` | `update_message_cas` | `list_messages` |
 | Provider | `MustCreate` | `update_message_cas` | `list_messages` |
-| ProviderProfile | `MustCreate` | (immutable) | `list_messages` |
+| ProviderProfile | `MustCreate` | `MatchResourceVersion` | `list_messages` |
 | InferenceRoute | `MustCreate` | `update_message_cas` | `list_messages` |
 | SandboxPolicy | scoped versioning | scoped versioning | scoped query |
 | Settings | `Mutex`-guarded | `Mutex`-guarded | single-row |
@@ -239,17 +425,56 @@ gateways, the Mutex alone would be insufficient. Sandbox-scoped settings
 rely entirely on CAS without a Mutex.
 
 The `resource_version` is surfaced to clients through `ObjectMeta` in proto
-responses. Database migrations backfill existing rows with version 1.
+responses. Provider profiles are the exception: custom profile get/list/export
+responses copy the stored version onto the profile payload so exported YAML can
+carry the expected version for safe single-profile updates. Profile update
+requests also carry an explicit target profile ID; the payload ID must match the
+target so an edited export cannot overwrite a different profile. Database
+migrations backfill existing rows with version 1.
+
+Provider profile imports, updates, and deletes hold the sandbox synchronization
+guard while checking attached-sandbox dynamic token grant ambiguity or in-use
+state and writing the profile record. Sandbox creation with initial providers and
+sandbox provider attach/detach use the same guard, so one gateway process cannot
+interleave a profile mutation with a sandbox provider-set mutation that would
+leave an ambiguous final dynamic-token state or a deleted custom profile that is
+still referenced by a sandbox.
 
 Policy and runtime settings are delivered together through the effective sandbox
 config path. A gateway-global policy can override sandbox-scoped policy. The
 sandbox supervisor polls for config revisions and hot-reloads dynamic policy
 when the policy engine accepts the update.
 
+External supervisor middleware registration is operator-owned configuration
+under `[[openshell.supervisor.middleware]]`. At startup the gateway connects to
+each service and validates its described bindings and operator body limit.
+Policies attach a complete external middleware by its operator-owned registration
+name. Manifest bindings are identified by operation and phase, and each manifest
+may declare at most one binding for an operation and phase pair.
+Attaching a registration does not require it to advertise every supported
+operation. Supervisors select only the manifest bindings that match the current
+operation; policy-local config identity remains internal audit metadata.
+Before persisting a policy, the gateway asks each selected implementation to
+validate its config. The effective sandbox config contains only the registered
+services required by that policy; supervisors invoke those services directly on
+the request path.
+
 Provider credential expiry is enforced during gateway-to-sandbox credential
 resolution and again by the sandbox placeholder resolver. This keeps expired
 credentials from resolving even when a running sandbox still has retained
 placeholder generations from an earlier provider credential snapshot.
+
+Static credential delivery is capability-negotiated and endpoint-bound. The
+gateway classifies each returned environment entry as either a credential or
+non-secret provider configuration and associates every credential key with the
+host, port, and path selectors from its effective provider profile. It withholds
+static credential material from supervisors that do not advertise binding
+support. If a selected provider profile has no usable endpoint, the gateway
+withholds only that profile's static credential keys and their expiry and
+binding metadata. It continues to return provider-generated non-secret
+configuration, valid endpoint-bound static credentials from other attached
+providers, and the dynamic credential snapshot. Provider environment revisions
+include profile endpoint and binding changes.
 
 ## Inference Resolution
 
@@ -257,7 +482,7 @@ Cluster inference routes store only `provider_name`, `model_id`, and optional
 timeout. The gateway resolves endpoint URLs, protocols, credentials, auth
 style, and route-shaping metadata from the provider record when supervisors call
 `GetInferenceBundle`. Supported provider types for cluster inference are
-`openai`, `anthropic`, `nvidia`, and `google-vertex-ai`.
+`openai`, `anthropic`, `nvidia`, `deepinfra`, and `google-vertex-ai`.
 
 The bundle carries enough information for sandbox-local routers to construct
 upstream URLs without re-deriving provider-specific routing logic. Each resolved
@@ -343,6 +568,15 @@ The same relay pattern backs interactive SSH, command execution, file sync, and
 local service forwarding. The gateway tracks live sessions in memory and
 persists session records so tokens can expire or be revoked.
 
+Relay liveness has two backstops so a reset supervisor session cannot leave a
+request parked forever. The gateway runs server-side HTTP/2 keepalive on
+supervisor connections, and each exec relay's SSH client uses SSH keepalive: an
+exec channel may be legitimately silent for a long time (e.g. an agent whose
+stdout is redirected to a file), so the exec is never ended on output-idle
+alone — instead an unanswered keepalive on a wedged or orphaned relay closes the
+channel and returns the exec with an error. Once a command reports its exit
+status, the gateway also bounds how long it waits for the trailing channel close.
+
 `ForwardTcp` is the client-facing byte stream for SSH and service forwarding.
 The first frame is a `TcpForwardInit` that carries the sandbox ID, an
 authorization token from `CreateSshSession`, and an explicit target:
@@ -380,8 +614,8 @@ hook Job using the gateway image itself -- no separate cert-generation image,
 no extra mirror burden in air-gapped environments. In the default built-in PKI
 path the hook creates TLS and sandbox JWT Secrets. When cert-manager is enabled,
 cert-manager owns TLS Secrets and the hook runs with `--jwt-only` so the
-required sandbox JWT Secret still exists before the gateway StatefulSet mounts
-it, even if `pkiInitJob.enabled` remains true. On package-managed local
+required sandbox JWT Secret still exists before the gateway workload mounts it,
+even if `pkiInitJob.enabled` remains true. On package-managed local
 gateways, the same command runs from the systemd
 unit's `ExecStartPre` to bootstrap PKI into the configured local TLS directory
 on first start. The Linux package unit defaults that directory to
@@ -438,6 +672,56 @@ Driver-specific values that are not part of the inheritance allowlist
 (e.g. Podman `socket_path`, VM `vcpus`) only come from the driver's own
 table.
 
+### OTLP export
+
+The gateway already uses Rust's `tracing` framework for structured log events
+and request-span context consumed by stdout and the sandbox log bus. OTLP export
+adds an OpenTelemetry layer to the same subscriber. That layer turns selected
+`tracing` spans into distributed traces; it does not export log events or
+replace the existing logging paths.
+
+`[openshell.gateway.otlp]` is the only enablement path for OpenTelemetry
+export: the table's presence is the on-switch, and `OTEL_EXPORTER_OTLP_ENDPOINT`
+is ignored so enablement has a single source. TOML decides whether and where
+to export; the SDK's `OTEL_*` variables tune how. Transport is OTLP over gRPC
+only. Shared provider, resource, and tracing-layer construction lives in
+`openshell-otel`, along with shared HTTP/tonic trace-context propagation and
+gRPC failure recording.
+
+The `tower_http` `TraceLayer` in `multiplex.rs` opens a span per inbound request,
+and that span continues incoming W3C trace context when present or starts a new
+trace otherwise. It is named for the RPC and carries the request ID that also
+appears in the gateway's logs — the identifier that lets an operator pivot
+between a trace and its log lines. Store and compute-driver spans become
+children of the request span. Reconciliation, provider refresh, and
+driver-watch loops create their own operation spans because they have no
+inbound request to provide a parent. gRPC status is recorded when response
+trailers arrive.
+
+The gateway forwards OTLP configuration and W3C trace context to managed
+external drivers. Each driver exports under its own service name.
+
+Two invariants shape the failure behavior. Telemetry is diagnostic, so no OTLP
+failure stops the gateway from serving: a malformed endpoint is logged at
+startup and disables export. Export is best-effort — the SDK logs runtime
+failures, and a failed batch is dropped rather than retried. Buffered spans
+flush after the server loop exits so `SIGTERM` does not drop in-flight traces.
+
+### Package-managed gateway registry
+
+The CLI reads its active-gateway and per-gateway metadata from
+`$XDG_CONFIG_HOME/openshell/`. It also looks for a package-manager owned
+system config root at `/etc/openshell`, using the same layout as the per-user
+config root: `active_gateway` plus `gateways/<name>/metadata.json`. Packages
+or runtimes that need a different location can override that root with a
+non-empty absolute `OPENSHELL_SYSTEM_GATEWAY_DIR`; empty or relative values
+fall back to `/etc/openshell` and emit a warning. The CLI falls back to this
+system config when no per-user `metadata.json` exists; malformed user metadata
+still shadows the system entry, but stray empty directories do not.
+
+System entries are read-only from the CLI, so `gateway remove` rejects a pure
+system entry instead of pretending to delete package-manager owned state.
+
 ## Operational Constraints
 
 - Gateway TLS and client certificate distribution are deployment concerns owned
@@ -445,12 +729,19 @@ table.
 - Compute runtimes own the mechanics of starting workloads and injecting
   callback configuration.
 - Docker-backed local gateways use Docker's `host-gateway` callback alias on
-  macOS and Docker Desktop-style runtimes. Native Linux Docker may expose an
-  additional bridge-gateway listener because the host can bind that bridge IP.
+  macOS and Docker Desktop-style runtimes. They request IPv4 loopback callback
+  reachability and add a listener only when the primary does not cover it.
+  Native Linux Docker may expose an additional bridge-gateway listener because
+  the host can bind that bridge IP.
 - Podman-backed macOS gateways use gvproxy's host-loopback IP for sandbox host
   aliases by default so stale Podman machine images do not need Podman's
   `host-gateway` resolver. Linux Podman keeps the resolver unless
-  `host_gateway_ip` is configured.
+  `host_gateway_ip` is configured. Rootful Podman can request its exact bridge
+  gateway listener. Rootless Podman explicitly reporting pasta requests the
+  private IPv4 source selected by the host default route rather than an
+  arbitrary private interface. Slirp4netns, other helpers, and missing helper
+  metadata fail closed for local callbacks until a rootless-network namespace
+  relay is available.
 - Gateway restarts recover persisted objects from storage, but live relay
   streams must be re-established by supervisors.
 - User-facing behavior changes must update published docs in `docs/`; this file

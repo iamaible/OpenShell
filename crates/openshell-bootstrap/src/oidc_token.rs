@@ -7,7 +7,7 @@
 //! `$XDG_CONFIG_HOME/openshell/gateways/<name>/oidc_token.json`.
 //! File permissions are `0600` (owner-only).
 
-use crate::paths::gateways_dir;
+use crate::paths::user_gateway_dir;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::paths::{ensure_parent_dir_restricted, set_file_owner_only};
 use serde::{Deserialize, Serialize};
@@ -36,7 +36,12 @@ pub struct OidcTokenBundle {
 
 /// Path to the stored OIDC token bundle for a gateway.
 pub fn oidc_token_path(gateway_name: &str) -> Result<PathBuf> {
-    Ok(gateways_dir()?.join(gateway_name).join("oidc_token.json"))
+    Ok(user_gateway_dir(gateway_name)?.join("oidc_token.json"))
+}
+
+/// Path to the one-shot marker that asks the next browser login to prompt.
+pub fn oidc_login_prompt_required_path(gateway_name: &str) -> Result<PathBuf> {
+    Ok(user_gateway_dir(gateway_name)?.join("oidc_login_prompt_required"))
 }
 
 /// Store an OIDC token bundle for a gateway.
@@ -50,6 +55,7 @@ pub fn store_oidc_token(gateway_name: &str, bundle: &OidcTokenBundle) -> Result<
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to write OIDC token to {}", path.display()))?;
     set_file_owner_only(&path)?;
+    clear_oidc_login_prompt(gateway_name)?;
     Ok(())
 }
 
@@ -76,6 +82,33 @@ pub fn remove_oidc_token(gateway_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Mark the next interactive OIDC login as requiring a fresh `IdP` prompt.
+pub fn request_oidc_login_prompt(gateway_name: &str) -> Result<()> {
+    let path = oidc_login_prompt_required_path(gateway_name)?;
+    ensure_parent_dir_restricted(&path)?;
+    std::fs::write(&path, b"1\n")
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write {}", path.display()))?;
+    set_file_owner_only(&path)?;
+    Ok(())
+}
+
+/// Return whether the next interactive OIDC login should request a fresh prompt.
+pub fn oidc_login_prompt_required(gateway_name: &str) -> bool {
+    oidc_login_prompt_required_path(gateway_name).is_ok_and(|path| path.exists())
+}
+
+/// Clear the one-shot fresh-login marker for a gateway.
+pub fn clear_oidc_login_prompt(gateway_name: &str) -> Result<()> {
+    let path = oidc_login_prompt_required_path(gateway_name)?;
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Check if the stored access token is expired or near expiry.
 ///
 /// Returns `true` if the token expires within the next 30 seconds.
@@ -89,4 +122,76 @@ pub fn is_token_expired(bundle: &OidcTokenBundle) -> bool {
         .unwrap_or_default()
         .as_secs();
     now + 30 >= expires_at
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[allow(unsafe_code)]
+    fn with_tmp_xdg<F: FnOnce()>(tmp: &std::path::Path, f: F) {
+        let _guard = crate::XDG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let orig = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp);
+        }
+        f();
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn oidc_token_paths_reject_multi_component_gateway_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            let bundle = OidcTokenBundle {
+                access_token: "token".to_string(),
+                refresh_token: None,
+                expires_at: None,
+                issuer: "https://issuer.example.com".to_string(),
+                client_id: "openshell-cli".to_string(),
+            };
+            assert!(store_oidc_token("../escape", &bundle).is_err());
+            assert!(load_oidc_token("../escape").is_none());
+            assert!(remove_oidc_token("../escape").is_err());
+        });
+    }
+
+    #[test]
+    fn oidc_login_prompt_marker_is_per_gateway() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            assert!(!oidc_login_prompt_required("alpha"));
+            assert!(!oidc_login_prompt_required("beta"));
+
+            request_oidc_login_prompt("alpha").unwrap();
+
+            assert!(oidc_login_prompt_required("alpha"));
+            assert!(!oidc_login_prompt_required("beta"));
+
+            let bundle = OidcTokenBundle {
+                access_token: "token".to_string(),
+                refresh_token: None,
+                expires_at: None,
+                issuer: "https://issuer.example.com".to_string(),
+                client_id: "openshell-cli".to_string(),
+            };
+            store_oidc_token("alpha", &bundle).unwrap();
+
+            assert!(!oidc_login_prompt_required("alpha"));
+
+            request_oidc_login_prompt("alpha").unwrap();
+            assert!(oidc_login_prompt_required("alpha"));
+
+            clear_oidc_login_prompt("alpha").unwrap();
+
+            assert!(!oidc_login_prompt_required("alpha"));
+        });
+    }
 }

@@ -7,11 +7,15 @@
 
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(test)]
+pub(crate) mod test_utils;
 
 pub mod auth;
+pub(crate) mod commands;
 pub mod completers;
 pub mod edge_tunnel;
 pub mod oidc_auth;
+pub mod output;
 pub(crate) mod policy_update;
 pub mod run;
 pub mod ssh;

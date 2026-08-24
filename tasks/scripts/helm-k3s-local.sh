@@ -32,6 +32,12 @@ HOST_LB_PORT="${HELM_K3S_LB_HOST_PORT:-8080}"
 DEFAULT_SANDBOX_PRELOAD_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 PRELOAD_SANDBOX_IMAGE="${HELM_K3S_PRELOAD_SANDBOX_IMAGE-${DEFAULT_SANDBOX_PRELOAD_IMAGE}}"
 
+# Upstream agent-sandbox release pinned for both CRDs/controller and extensions.
+# The Kubernetes driver supports the v1beta1 Sandbox API introduced in v0.5.0
+# and falls back to v1alpha1 for v0.4.6 clusters. Override this env var to
+# exercise the v1alpha1 controller release.
+AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v0.5.0}"
+
 default_kubeconfig="${ROOT}/kubeconfig"
 if [[ -n "${HELM_K3S_KUBECONFIG:-}" ]]; then
   KUBECONFIG_TARGET="${HELM_K3S_KUBECONFIG}"
@@ -135,9 +141,9 @@ merge_kubeconfig() {
 
 apply_base_manifests() {
   require_kubectl
-  local manifest="${ROOT}/deploy/kube/manifests/agent-sandbox.yaml"
-  echo "Applying agent-sandbox manifests..."
-  kubectl --kubeconfig="${KUBECONFIG_TARGET}" apply -f "${manifest}"
+  local base="https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}"
+  echo "Applying agent-sandbox manifest (${AGENT_SANDBOX_VERSION})..."
+  kubectl --kubeconfig="${KUBECONFIG_TARGET}" apply -f "${base}/manifest.yaml"
 }
 
 configure_ghcr_credentials() {
@@ -224,11 +230,13 @@ preload_sandbox_image() {
     docker pull --platform "${platform}" "${PRELOAD_SANDBOX_IMAGE}"
   fi
 
+  # Save without --platform: the platform-specific pull already constrained the
+  # local image, and --platform fails on OCI index (multi-arch) manifests.
   tmp="$(mktemp "${TMPDIR:-/tmp}/openshell-sandbox-image.XXXXXX")"
-  if ! docker image save --platform "${platform}" -o "${tmp}" "${PRELOAD_SANDBOX_IMAGE}"; then
+  if ! docker image save -o "${tmp}" "${PRELOAD_SANDBOX_IMAGE}"; then
     echo "Pulling sandbox image for ${platform}..."
     docker pull --platform "${platform}" "${PRELOAD_SANDBOX_IMAGE}"
-    docker image save --platform "${platform}" -o "${tmp}" "${PRELOAD_SANDBOX_IMAGE}"
+    docker image save -o "${tmp}" "${PRELOAD_SANDBOX_IMAGE}"
   fi
 
   if ! k3d image import "${tmp}" --cluster "${CLUSTER_NAME}"; then

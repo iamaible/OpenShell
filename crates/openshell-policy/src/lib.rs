@@ -10,25 +10,38 @@
 //! these types, ensuring round-trip fidelity.
 
 mod compose;
+mod l7_validate;
 mod merge;
+mod middleware;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
 
+mod ambiguity;
+
+pub use ambiguity::{EndpointAmbiguity, find_endpoint_ambiguities};
+
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
-    LandlockPolicy, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
+    LandlockPolicy, McpOptions, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
     SandboxPolicy,
 };
 use serde::{Deserialize, Serialize};
 
-pub use compose::{ProviderPolicyLayer, compose_effective_policy, provider_rule_name};
+pub use compose::{
+    PROVIDER_RULE_NAME_PREFIX, ProviderPolicyLayer, compose_effective_policy,
+    is_provider_rule_name, provider_rule_name, strip_provider_rule_names,
+};
+pub use l7_validate::{L7EndpointFields, L7Protocol, validate_l7_endpoint_semantics};
 pub use merge::{
     PolicyMergeError, PolicyMergeOp, PolicyMergeResult, PolicyMergeWarning, generated_rule_name,
     merge_policy, policy_covers_rule,
 };
+pub use middleware::middleware_host_matches;
+pub use middleware::validate_json as validate_network_middleware_json;
+pub use middleware::validate_json_with_config as validate_network_middleware_json_with_config;
 
 // ---------------------------------------------------------------------------
 // YAML serde types (canonical — used for both parsing and serialization)
@@ -46,6 +59,8 @@ struct PolicyFile {
     process: Option<ProcessDef>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     network_policies: BTreeMap<String, NetworkPolicyRuleDef>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    network_middlewares: BTreeMap<String, middleware::NetworkMiddlewareConfigDef>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -88,6 +103,10 @@ struct NetworkPolicyRuleDef {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "Endpoint DTO mirrors independent policy schema toggles."
+)]
 struct NetworkEndpointDef {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     host: String,
@@ -129,12 +148,34 @@ struct NetworkEndpointDef {
     /// placeholders before forwarding upstream. Defaults to false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     request_body_credential_rewrite: bool,
+    /// Explicitly permits credentials on traffic paths that `OpenShell` cannot
+    /// inspect or rewrite. Defaults to false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    allow_uninspected_credentials: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     persisted_queries: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     graphql_persisted_queries: BTreeMap<String, GraphqlOperationDef>,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     graphql_max_body_bytes: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    credential_signing: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    signing_service: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    signing_region: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_binding: Option<NetworkCredentialBindingDef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    json_rpc: Option<JsonRpcConfigDef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mcp: Option<McpConfigDef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkCredentialBindingDef {
+    provider: String,
 }
 
 // Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
@@ -147,6 +188,109 @@ fn is_zero(v: &u16) -> bool {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JsonRpcConfigDef {
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    max_body_bytes: u32,
+}
+
+fn json_rpc_config_from_proto(max_body_bytes: u32) -> Option<JsonRpcConfigDef> {
+    (max_body_bytes > 0).then_some(JsonRpcConfigDef { max_body_bytes })
+}
+
+// MCP rides the same HTTP/JSON-RPC inspection machinery at runtime, but it
+// gets its own policy stanza so user-authored YAML can name the primary
+// protocol instead of treating MCP as generic JSON-RPC.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpConfigDef {
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    max_body_bytes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    strict_tool_names: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allow_all_known_mcp_methods: Option<bool>,
+}
+
+fn mcp_config_from_proto(max_body_bytes: u32, mcp: Option<&McpOptions>) -> Option<McpConfigDef> {
+    let strict_tool_names = mcp.and_then(|config| config.strict_tool_names);
+    let allow_all_known_mcp_methods = mcp.and_then(|config| config.allow_all_known_mcp_methods);
+    (max_body_bytes > 0 || strict_tool_names.is_some() || allow_all_known_mcp_methods.is_some())
+        .then_some(McpConfigDef {
+            max_body_bytes,
+            strict_tool_names,
+            allow_all_known_mcp_methods,
+        })
+}
+
+/// Nested L7 config stanzas accepted by the YAML policy schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L7ConfigStanza {
+    JsonRpc,
+    Mcp,
+}
+
+impl L7ConfigStanza {
+    pub const ALL: [Self; 2] = [Self::JsonRpc, Self::Mcp];
+
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::JsonRpc => "json_rpc",
+            Self::Mcp => "mcp",
+        }
+    }
+}
+
+/// Parse an L7 nested config stanza and return the flattened runtime fields
+/// consumed by the supervisor policy engine.
+///
+/// The stanza schema stays tied to this crate's canonical serde definitions, so
+/// adding a new supported field requires updating this conversion next to the
+/// type that parses it.
+pub fn l7_config_alias_runtime_fields(
+    stanza: L7ConfigStanza,
+    value: serde_json::Value,
+) -> Result<Vec<(&'static str, serde_json::Value)>> {
+    match stanza {
+        L7ConfigStanza::JsonRpc => {
+            let JsonRpcConfigDef { max_body_bytes } = serde_json::from_value(value)
+                .map_err(|error| miette::miette!("invalid json_rpc config: {error}"))?;
+            let mut fields = Vec::new();
+            if max_body_bytes > 0 {
+                fields.push(("json_rpc_max_body_bytes", serde_json::json!(max_body_bytes)));
+            }
+            Ok(fields)
+        }
+        L7ConfigStanza::Mcp => {
+            let McpConfigDef {
+                max_body_bytes,
+                strict_tool_names,
+                allow_all_known_mcp_methods,
+            } = serde_json::from_value(value)
+                .map_err(|error| miette::miette!("invalid mcp config: {error}"))?;
+            let mut fields = Vec::new();
+            if max_body_bytes > 0 {
+                fields.push(("json_rpc_max_body_bytes", serde_json::json!(max_body_bytes)));
+            }
+            if let Some(strict_tool_names) = strict_tool_names {
+                fields.push((
+                    "mcp_strict_tool_names",
+                    serde_json::json!(strict_tool_names),
+                ));
+            }
+            if let Some(allow_all_known_mcp_methods) = allow_all_known_mcp_methods {
+                fields.push((
+                    "mcp_allow_all_known_mcp_methods",
+                    serde_json::json!(allow_all_known_mcp_methods),
+                ));
+            }
+            Ok(fields)
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -183,16 +327,31 @@ struct L7AllowDef {
     operation_name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool: Option<QueryMatcherDef>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    params: BTreeMap<String, ParamMatcherDef>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 enum QueryMatcherDef {
+    // Short form: `query: { repo: "NVIDIA/*" }`.
     Glob(String),
+    // Expanded form: `query: { repo: { any: ["NVIDIA/*", "openai/*"] } }`.
     Any(QueryAnyDef),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+// MCP params can be authored as nested maps in YAML, but the runtime matcher
+// map remains flat so the Rego policy can share query-param matching.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum ParamMatcherDef {
+    Matcher(QueryMatcherDef),
+    Object(BTreeMap<String, Self>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct QueryAnyDef {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -216,6 +375,10 @@ struct L7DenyRuleDef {
     operation_name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool: Option<QueryMatcherDef>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    params: BTreeMap<String, ParamMatcherDef>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -232,7 +395,315 @@ struct NetworkBinaryDef {
 // YAML → proto conversion
 // ---------------------------------------------------------------------------
 
-fn to_proto(raw: PolicyFile) -> SandboxPolicy {
+fn matcher_def_to_proto(matcher: QueryMatcherDef) -> L7QueryMatcher {
+    match matcher {
+        QueryMatcherDef::Glob(glob) => L7QueryMatcher { glob, any: vec![] },
+        QueryMatcherDef::Any(any) => L7QueryMatcher {
+            glob: String::new(),
+            any: any.any,
+        },
+    }
+}
+
+fn matcher_proto_to_def(matcher: L7QueryMatcher) -> QueryMatcherDef {
+    if matcher.any.is_empty() {
+        QueryMatcherDef::Glob(matcher.glob)
+    } else {
+        QueryMatcherDef::Any(QueryAnyDef { any: matcher.any })
+    }
+}
+
+// Convert MCP params maps into the flat proto/Rego keyspace. Only `name` is
+// currently enforced for tools/call, but this keeps the YAML shape compatible
+// with any future MCP-owned params selectors.
+fn flatten_param_matchers(
+    params: BTreeMap<String, ParamMatcherDef>,
+) -> BTreeMap<String, QueryMatcherDef> {
+    let mut flattened = BTreeMap::new();
+    for (key, matcher) in params {
+        flatten_param_matcher(&key, matcher, &mut flattened);
+    }
+    flattened
+}
+
+// Walk one params subtree, carrying the flattened dot-path key accumulated so
+// far. Leaf matchers are inserted into the map consumed by the runtime policy.
+fn flatten_param_matcher(
+    key: &str,
+    matcher: ParamMatcherDef,
+    out: &mut BTreeMap<String, QueryMatcherDef>,
+) {
+    match matcher {
+        ParamMatcherDef::Matcher(matcher) => {
+            out.insert(key.to_string(), matcher);
+        }
+        ParamMatcherDef::Object(children) => {
+            for (child_key, child) in children {
+                let nested_key = format!("{key}.{child_key}");
+                flatten_param_matcher(&nested_key, child, out);
+            }
+        }
+    }
+}
+
+// Convert flat runtime params back to YAML. MCP gets readable nested params
+// when the flat keys can be losslessly split. Non-MCP protocols keep flat keys
+// only for lossless serialization; generic JSON-RPC validation rejects params
+// matchers before enforcement.
+fn flat_params_to_def(
+    protocol: &str,
+    params: BTreeMap<String, QueryMatcherDef>,
+) -> BTreeMap<String, ParamMatcherDef> {
+    let flat = params.into_iter().collect::<Vec<_>>();
+    // MCP uses nested YAML for readability. Non-MCP protocols keep the flat
+    // form for lossless serialization of existing proto data only.
+    if !is_mcp_protocol(protocol) {
+        return flat_param_matchers_to_def(flat);
+    }
+
+    let mut nested = BTreeMap::new();
+    for (key, matcher) in &flat {
+        if insert_nested_param(&mut nested, key, ParamMatcherDef::Matcher(matcher.clone())).is_err()
+        {
+            return flat_param_matchers_to_def(flat);
+        }
+    }
+    nested
+}
+
+fn flat_param_matchers_to_def(
+    params: Vec<(String, QueryMatcherDef)>,
+) -> BTreeMap<String, ParamMatcherDef> {
+    params
+        .into_iter()
+        .map(|(key, matcher)| (key, ParamMatcherDef::Matcher(matcher)))
+        .collect()
+}
+
+// Build one nested params path from a flat key. Collisions such as `a` and
+// `a.b` cannot round-trip as nested YAML, so callers fall back to the flat map.
+fn insert_nested_param(
+    root: &mut BTreeMap<String, ParamMatcherDef>,
+    key: &str,
+    matcher: ParamMatcherDef,
+) -> Result<(), ()> {
+    let mut parts = key.split('.').peekable();
+    let Some(first) = parts.next() else {
+        return Err(());
+    };
+
+    if parts.peek().is_none() {
+        root.insert(first.to_string(), matcher);
+        return Ok(());
+    }
+
+    let child = root
+        .entry(first.to_string())
+        .or_insert_with(|| ParamMatcherDef::Object(BTreeMap::new()));
+    let ParamMatcherDef::Object(children) = child else {
+        return Err(());
+    };
+    let remainder = parts.collect::<Vec<_>>().join(".");
+    insert_nested_param(children, &remainder, matcher)
+}
+
+// MCP `tool` is a policy convenience for the standard `tools/call` params.name
+// field. When the endpoint method profile is enabled, authored tool selectors
+// can omit method and are normalized to tools/call internally. Tool arguments
+// intentionally have no policy matcher yet, so every allowed tool call permits
+// all argument payloads by default.
+fn params_with_tool(
+    mut params: BTreeMap<String, ParamMatcherDef>,
+    tool: Option<QueryMatcherDef>,
+) -> BTreeMap<String, ParamMatcherDef> {
+    if let Some(tool) = tool {
+        params
+            .entry("name".to_string())
+            .or_insert_with(|| ParamMatcherDef::Matcher(tool));
+    }
+    params
+}
+
+fn allow_def_to_proto(_protocol: &str, allow: L7AllowDef) -> L7Allow {
+    let params = flatten_param_matchers(params_with_tool(allow.params, allow.tool));
+    L7Allow {
+        method: allow.method,
+        path: allow.path,
+        command: allow.command,
+        operation_type: allow.operation_type,
+        operation_name: allow.operation_name,
+        fields: allow.fields,
+        query: allow
+            .query
+            .into_iter()
+            .map(|(key, matcher)| (key, matcher_def_to_proto(matcher)))
+            .collect(),
+        params: params
+            .into_iter()
+            .map(|(key, matcher)| (key, matcher_def_to_proto(matcher)))
+            .collect(),
+    }
+}
+
+fn deny_def_to_proto(_protocol: &str, deny: L7DenyRuleDef) -> L7DenyRule {
+    let params = flatten_param_matchers(params_with_tool(deny.params, deny.tool));
+    L7DenyRule {
+        method: deny.method,
+        path: deny.path,
+        command: deny.command,
+        operation_type: deny.operation_type,
+        operation_name: deny.operation_name,
+        fields: deny.fields,
+        query: deny
+            .query
+            .into_iter()
+            .map(|(key, matcher)| (key, matcher_def_to_proto(matcher)))
+            .collect(),
+        params: params
+            .into_iter()
+            .map(|(key, matcher)| (key, matcher_def_to_proto(matcher)))
+            .collect(),
+    }
+}
+
+fn json_rpc_max_body_bytes(json_rpc: &Option<JsonRpcConfigDef>, mcp: &Option<McpConfigDef>) -> u32 {
+    // The proto has one JSON-RPC-family body limit. Prefer the MCP stanza when
+    // present because MCP policies should not need a shadow `json_rpc` block.
+    mcp.as_ref().map_or_else(
+        || json_rpc.as_ref().map_or(0, |config| config.max_body_bytes),
+        |config| config.max_body_bytes,
+    )
+}
+
+fn mcp_strict_tool_names(mcp: &Option<McpConfigDef>) -> Option<bool> {
+    mcp.as_ref().and_then(|config| config.strict_tool_names)
+}
+
+fn mcp_allow_all_known_mcp_methods(mcp: &Option<McpConfigDef>) -> Option<bool> {
+    mcp.as_ref()
+        .and_then(|config| config.allow_all_known_mcp_methods)
+}
+
+fn mcp_options(mcp: &Option<McpConfigDef>) -> Option<McpOptions> {
+    let strict_tool_names = mcp_strict_tool_names(mcp);
+    let allow_all_known_mcp_methods = mcp_allow_all_known_mcp_methods(mcp);
+    (strict_tool_names.is_some() || allow_all_known_mcp_methods.is_some()).then_some(McpOptions {
+        strict_tool_names,
+        allow_all_known_mcp_methods,
+    })
+}
+
+fn is_mcp_protocol(protocol: &str) -> bool {
+    protocol.eq_ignore_ascii_case("mcp")
+}
+
+fn split_tool_param(
+    protocol: &str,
+    params: BTreeMap<String, QueryMatcherDef>,
+) -> (Option<QueryMatcherDef>, BTreeMap<String, QueryMatcherDef>) {
+    // Only MCP has the tool-name convention. Non-MCP protocols preserve proto
+    // params on round-trip without inventing MCP semantics.
+    if !is_mcp_protocol(protocol) {
+        return (None, params);
+    }
+
+    let mut params = params;
+    let tool = params.remove("name");
+    (tool, params)
+}
+
+fn allow_proto_to_def(
+    protocol: &str,
+    allow: L7Allow,
+    mcp_allow_all_known_mcp_methods: bool,
+) -> L7AllowDef {
+    let params: BTreeMap<String, QueryMatcherDef> = allow
+        .params
+        .into_iter()
+        .map(|(key, matcher)| (key, matcher_proto_to_def(matcher)))
+        .collect();
+    let (tool, params) = split_tool_param(protocol, params);
+    let params = flat_params_to_def(protocol, params);
+    let method = yaml_mcp_method(
+        protocol,
+        &allow.method,
+        tool.is_some(),
+        mcp_allow_all_known_mcp_methods,
+    );
+    L7AllowDef {
+        method,
+        path: allow.path,
+        command: allow.command,
+        query: allow
+            .query
+            .into_iter()
+            .map(|(key, matcher)| (key, matcher_proto_to_def(matcher)))
+            .collect(),
+        operation_type: allow.operation_type,
+        operation_name: allow.operation_name,
+        fields: allow.fields,
+        tool,
+        params,
+    }
+}
+
+fn deny_proto_to_def(
+    protocol: &str,
+    deny: &L7DenyRule,
+    mcp_allow_all_known_mcp_methods: bool,
+) -> L7DenyRuleDef {
+    let params: BTreeMap<String, QueryMatcherDef> = deny
+        .params
+        .iter()
+        .map(|(key, matcher)| (key.clone(), matcher_proto_to_def(matcher.clone())))
+        .collect();
+    let (tool, params) = split_tool_param(protocol, params);
+    let params = flat_params_to_def(protocol, params);
+    let method = yaml_mcp_method(
+        protocol,
+        &deny.method,
+        tool.is_some(),
+        mcp_allow_all_known_mcp_methods,
+    );
+    L7DenyRuleDef {
+        method,
+        path: deny.path.clone(),
+        command: deny.command.clone(),
+        query: deny
+            .query
+            .iter()
+            .map(|(key, matcher)| (key.clone(), matcher_proto_to_def(matcher.clone())))
+            .collect(),
+        operation_type: deny.operation_type.clone(),
+        operation_name: deny.operation_name.clone(),
+        fields: deny.fields.clone(),
+        tool,
+        params,
+    }
+}
+
+fn yaml_mcp_method(
+    protocol: &str,
+    method: &str,
+    has_tool: bool,
+    mcp_allow_all_known_mcp_methods: bool,
+) -> String {
+    if is_mcp_protocol(protocol) {
+        if !has_tool && method == "*" {
+            return String::new();
+        }
+        if has_tool && method == "tools/call" && mcp_allow_all_known_mcp_methods {
+            return String::new();
+        }
+    }
+    method.to_string()
+}
+
+fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
+    let network_middlewares = middleware::into_proto(raw.network_middlewares)
+        .into_diagnostic()
+        .wrap_err("failed to convert network middleware config")?;
+
     let network_policies = raw
         .network_policies
         .into_iter()
@@ -247,6 +718,9 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                     .endpoints
                     .into_iter()
                     .map(|e| {
+                        let protocol = e.protocol;
+                        let allow_rules = e.rules;
+                        let deny_rules = e.deny_rules;
                         // Normalize port/ports: ports takes precedence, else
                         // single port is promoted to ports array.
                         let normalized_ports: Vec<u32> = if !e.ports.is_empty() {
@@ -261,73 +735,28 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                             path: e.path,
                             port: normalized_ports.first().copied().unwrap_or(0),
                             ports: normalized_ports,
-                            protocol: e.protocol,
+                            protocol: protocol.clone(),
                             tls: e.tls,
                             enforcement: e.enforcement,
                             access: e.access,
-                            rules: e
-                                .rules
+                            rules: allow_rules
                                 .into_iter()
                                 .map(|r| L7Rule {
-                                    allow: Some(L7Allow {
-                                        method: r.allow.method,
-                                        path: r.allow.path,
-                                        command: r.allow.command,
-                                        operation_type: r.allow.operation_type,
-                                        operation_name: r.allow.operation_name,
-                                        fields: r.allow.fields,
-                                        query: r
-                                            .allow
-                                            .query
-                                            .into_iter()
-                                            .map(|(key, matcher)| {
-                                                let proto = match matcher {
-                                                    QueryMatcherDef::Glob(glob) => {
-                                                        L7QueryMatcher { glob, any: vec![] }
-                                                    }
-                                                    QueryMatcherDef::Any(any) => L7QueryMatcher {
-                                                        glob: String::new(),
-                                                        any: any.any,
-                                                    },
-                                                };
-                                                (key, proto)
-                                            })
-                                            .collect(),
-                                    }),
+                                    allow: Some(allow_def_to_proto(&protocol, r.allow)),
                                 })
                                 .collect(),
                             allowed_ips: e.allowed_ips,
-                            deny_rules: e
-                                .deny_rules
+                            deny_rules: deny_rules
                                 .into_iter()
-                                .map(|d| L7DenyRule {
-                                    method: d.method,
-                                    path: d.path,
-                                    command: d.command,
-                                    operation_type: d.operation_type,
-                                    operation_name: d.operation_name,
-                                    fields: d.fields,
-                                    query: d
-                                        .query
-                                        .into_iter()
-                                        .map(|(key, matcher)| {
-                                            let proto = match matcher {
-                                                QueryMatcherDef::Glob(glob) => {
-                                                    L7QueryMatcher { glob, any: vec![] }
-                                                }
-                                                QueryMatcherDef::Any(any) => L7QueryMatcher {
-                                                    glob: String::new(),
-                                                    any: any.any,
-                                                },
-                                            };
-                                            (key, proto)
-                                        })
-                                        .collect(),
-                                })
+                                .map(|deny| deny_def_to_proto(&protocol, deny))
                                 .collect(),
                             allow_encoded_slash: e.allow_encoded_slash,
                             websocket_credential_rewrite: e.websocket_credential_rewrite,
                             request_body_credential_rewrite: e.request_body_credential_rewrite,
+                            allow_uninspected_credentials: e.allow_uninspected_credentials,
+                            // Provider credential provenance is derived by the
+                            // gateway and cannot be authored in policy YAML.
+                            provider_credentialed: false,
                             // Advisor provenance is internal runtime state, not
                             // a user-authored policy schema field.
                             advisor_proposed: false,
@@ -347,6 +776,16 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                 })
                                 .collect(),
                             graphql_max_body_bytes: e.graphql_max_body_bytes,
+                            credential_signing: e.credential_signing,
+                            signing_service: e.signing_service,
+                            signing_region: e.signing_region,
+                            credential_binding: e.credential_binding.map(|binding| {
+                                openshell_core::proto::NetworkCredentialBinding {
+                                    provider: binding.provider,
+                                }
+                            }),
+                            json_rpc_max_body_bytes: json_rpc_max_body_bytes(&e.json_rpc, &e.mcp),
+                            mcp: mcp_options(&e.mcp),
                         }
                     })
                     .collect(),
@@ -363,7 +802,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
         })
         .collect();
 
-    SandboxPolicy {
+    Ok(SandboxPolicy {
         version: raw.version,
         filesystem: raw.filesystem_policy.map(|fs| FilesystemPolicy {
             include_workdir: fs.include_workdir,
@@ -378,7 +817,8 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
             run_as_group: p.run_as_group,
         }),
         network_policies,
-    }
+        network_middlewares,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -426,76 +866,54 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                         } else {
                             (clamp(e.ports.first().copied().unwrap_or(e.port)), vec![])
                         };
+                        let protocol = e.protocol.clone();
+                        let mcp_allow_all_known_mcp_methods = !is_mcp_protocol(&protocol)
+                            || e.mcp
+                                .as_ref()
+                                .and_then(|options| options.allow_all_known_mcp_methods)
+                                .unwrap_or(false);
+                        let rules = e
+                            .rules
+                            .iter()
+                            .map(|r| L7RuleDef {
+                                allow: allow_proto_to_def(
+                                    &protocol,
+                                    r.allow.clone().unwrap_or_default(),
+                                    mcp_allow_all_known_mcp_methods,
+                                ),
+                            })
+                            .collect();
+                        let deny_rules: Vec<L7DenyRuleDef> = e
+                            .deny_rules
+                            .iter()
+                            .map(|d| {
+                                deny_proto_to_def(&protocol, d, mcp_allow_all_known_mcp_methods)
+                            })
+                            .collect();
+                        let (json_rpc, mcp) = if is_mcp_protocol(&protocol) {
+                            (
+                                None,
+                                mcp_config_from_proto(e.json_rpc_max_body_bytes, e.mcp.as_ref()),
+                            )
+                        } else {
+                            (json_rpc_config_from_proto(e.json_rpc_max_body_bytes), None)
+                        };
                         NetworkEndpointDef {
                             host: e.host.clone(),
                             path: e.path.clone(),
                             port,
                             ports,
-                            protocol: e.protocol.clone(),
+                            protocol,
                             tls: e.tls.clone(),
                             enforcement: e.enforcement.clone(),
                             access: e.access.clone(),
-                            rules: e
-                                .rules
-                                .iter()
-                                .map(|r| {
-                                    let a = r.allow.clone().unwrap_or_default();
-                                    L7RuleDef {
-                                        allow: L7AllowDef {
-                                            method: a.method,
-                                            path: a.path,
-                                            command: a.command,
-                                            operation_type: a.operation_type,
-                                            operation_name: a.operation_name,
-                                            fields: a.fields,
-                                            query: a
-                                                .query
-                                                .into_iter()
-                                                .map(|(key, matcher)| {
-                                                    let yaml_matcher = if matcher.any.is_empty() {
-                                                        QueryMatcherDef::Glob(matcher.glob)
-                                                    } else {
-                                                        QueryMatcherDef::Any(QueryAnyDef {
-                                                            any: matcher.any,
-                                                        })
-                                                    };
-                                                    (key, yaml_matcher)
-                                                })
-                                                .collect(),
-                                        },
-                                    }
-                                })
-                                .collect(),
+                            rules,
                             allowed_ips: e.allowed_ips.clone(),
-                            deny_rules: e
-                                .deny_rules
-                                .iter()
-                                .map(|d| L7DenyRuleDef {
-                                    method: d.method.clone(),
-                                    path: d.path.clone(),
-                                    command: d.command.clone(),
-                                    operation_type: d.operation_type.clone(),
-                                    operation_name: d.operation_name.clone(),
-                                    fields: d.fields.clone(),
-                                    query: d
-                                        .query
-                                        .iter()
-                                        .map(|(key, matcher)| {
-                                            let yaml_matcher = if matcher.any.is_empty() {
-                                                QueryMatcherDef::Glob(matcher.glob.clone())
-                                            } else {
-                                                QueryMatcherDef::Any(QueryAnyDef {
-                                                    any: matcher.any.clone(),
-                                                })
-                                            };
-                                            (key.clone(), yaml_matcher)
-                                        })
-                                        .collect(),
-                                })
-                                .collect(),
+                            deny_rules,
                             allow_encoded_slash: e.allow_encoded_slash,
                             websocket_credential_rewrite: e.websocket_credential_rewrite,
                             request_body_credential_rewrite: e.request_body_credential_rewrite,
+                            allow_uninspected_credentials: e.allow_uninspected_credentials,
                             persisted_queries: e.persisted_queries.clone(),
                             graphql_persisted_queries: e
                                 .graphql_persisted_queries
@@ -512,6 +930,16 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                 })
                                 .collect(),
                             graphql_max_body_bytes: e.graphql_max_body_bytes,
+                            credential_signing: e.credential_signing.clone(),
+                            signing_service: e.signing_service.clone(),
+                            signing_region: e.signing_region.clone(),
+                            credential_binding: e.credential_binding.as_ref().map(|binding| {
+                                NetworkCredentialBindingDef {
+                                    provider: binding.provider.clone(),
+                                }
+                            }),
+                            json_rpc,
+                            mcp,
                         }
                     })
                     .collect(),
@@ -528,13 +956,61 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
         })
         .collect();
 
+    let network_middlewares = middleware::from_proto(&policy.network_middlewares);
+
     PolicyFile {
         version: policy.version,
         filesystem_policy,
         landlock,
         process,
         network_policies,
+        network_middlewares,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox UID/GID constants
+// ---------------------------------------------------------------------------
+
+/// Minimum accepted UID/GID for sandbox workload identity.
+///
+/// Linux reserves only identity `0` for root. Non-root system identities are
+/// valid workload identities when selected explicitly by the operator.
+pub const MIN_SANDBOX_UID: u32 = 1;
+
+/// Maximum accepted UID/GID for sandbox workload identity.
+///
+/// `u32::MAX` represents an invalid or unchanged identity in Linux APIs and
+/// POSIX ACLs, so the largest usable workload identity is one less.
+pub const MAX_SANDBOX_UID: u32 = u32::MAX - 1;
+
+/// Minimum UID for the Kubernetes network proxy identity.
+///
+/// The proxy UID is exempt from the pod egress fence, so it remains in a
+/// dedicated infrastructure range even though workload identities may use
+/// non-root system IDs.
+pub const MIN_SANDBOX_PROXY_UID: u32 = 1000;
+
+/// The literal string value accepted as a valid sandbox user/group name.
+const SANDBOX_NAME: &str = "sandbox";
+
+/// Validate whether a process identity field value is acceptable.
+///
+/// Accepts either the literal `"sandbox"` or a numeric UID/GID parsed as
+/// `u32` within the range `[MIN_SANDBOX_UID, MAX_SANDBOX_UID]`.
+///
+/// Rejects:
+/// - The empty string (represents an omitted policy field)
+/// - UID/GID 0 (root)
+/// - `u32::MAX`, the invalid identity sentinel
+/// - Non-numeric strings other than `"sandbox"` (e.g. `"root"`, `"nobody"`)
+pub fn is_valid_sandbox_identity(value: &str) -> bool {
+    if value == SANDBOX_NAME {
+        return true;
+    }
+    value
+        .parse::<u32>()
+        .is_ok_and(|uid| (MIN_SANDBOX_UID..=MAX_SANDBOX_UID).contains(&uid))
 }
 
 // ---------------------------------------------------------------------------
@@ -546,7 +1022,7 @@ pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
     let raw: PolicyFile = serde_yml::from_str(yaml)
         .into_diagnostic()
         .wrap_err("failed to parse sandbox policy YAML")?;
-    Ok(to_proto(raw))
+    to_proto(raw)
 }
 
 /// Serialize a proto sandbox policy to a YAML string.
@@ -610,7 +1086,7 @@ pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolic
 ///
 /// When the gateway provides no policy at sandbox creation time, the sandbox
 /// supervisor probes this path before falling back to the restrictive default.
-pub const CONTAINER_POLICY_PATH: &str = "/etc/openshell/policy.yaml";
+pub use openshell_core::container_paths::CONTAINER_POLICY_PATH;
 
 /// Legacy path used before the navigator → openshell rename.
 ///
@@ -622,9 +1098,10 @@ pub const LEGACY_CONTAINER_POLICY_PATH: &str = "/etc/navigator/policy.yaml";
 /// Return a restrictive default policy suitable for sandboxes that have no
 /// explicit policy configured.
 ///
-/// This policy grants filesystem access to standard system paths, runs as the
-/// `sandbox` user, enables Landlock in best-effort mode, and **blocks all
-/// network access** (no network policies, no inference routing).
+/// This policy grants filesystem access to standard system paths, leaves
+/// process identity selection to the compute runtime, enables Landlock in
+/// best-effort mode, and **blocks all network access** (no network policies,
+/// no inference routing).
 pub fn restrictive_default_policy() -> SandboxPolicy {
     SandboxPolicy {
         version: 1,
@@ -639,24 +1116,22 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
                 "/etc".into(),
                 "/var/log".into(),
             ],
-            read_write: vec!["/sandbox".into(), "/tmp".into(), "/dev/null".into()],
+            read_write: vec!["/tmp".into(), "/dev/null".into()],
         }),
         landlock: Some(LandlockPolicy {
             compatibility: "best_effort".into(),
         }),
-        process: Some(ProcessPolicy {
-            run_as_user: "sandbox".into(),
-            run_as_group: "sandbox".into(),
-        }),
+        process: None,
         network_policies: HashMap::new(),
+        network_middlewares: HashMap::default(),
     }
 }
 
-/// Ensure the policy has `run_as_user: sandbox` and `run_as_group: sandbox`.
+/// Fill omitted process identity fields with the legacy `sandbox` defaults.
 ///
-/// If the process section is missing, or either field is empty, this fills in
-/// the required `"sandbox"` value. Call this before validation so that
-/// policies without an explicit process section get the correct default.
+/// Docker and Podman preserve omission so their supervisors can fall back to
+/// OCI `Config.User`. Other drivers call this before validation and
+/// persistence to retain the existing public policy representation.
 pub fn ensure_sandbox_process_identity(policy: &mut SandboxPolicy) {
     let process = policy.process.get_or_insert_with(ProcessPolicy::default);
     if process.run_as_user.is_empty() {
@@ -680,7 +1155,7 @@ const MAX_PATH_LENGTH: usize = 4096;
 /// A safety violation found in a sandbox policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyViolation {
-    /// `run_as_user` or `run_as_group` is not "sandbox".
+    /// An explicit `run_as_user` or `run_as_group` is unsafe.
     InvalidProcessIdentity { field: &'static str, value: String },
     /// A filesystem path contains `..` components.
     PathTraversal { path: String },
@@ -694,13 +1169,46 @@ pub enum PolicyViolation {
     TooManyPaths { count: usize },
     /// A network endpoint uses a TLD wildcard (e.g. `*.com`).
     TldWildcard { policy_name: String, host: String },
+    /// A network endpoint uses a wildcard shape that does not match runtime semantics.
+    InvalidHostWildcard { policy_name: String, host: String },
+    /// `credential_signing` is set but `signing_service` is missing.
+    MissingSigningService { policy_name: String, host: String },
+    /// `credential_signing` has an unrecognized value.
+    UnknownCredentialSigning {
+        policy_name: String,
+        host: String,
+        value: String,
+    },
+    /// `credential_signing` and `request_body_credential_rewrite` are both set.
+    CredentialSigningWithBodyRewrite { policy_name: String, host: String },
+    /// A middleware configuration is structurally invalid.
+    InvalidMiddlewareConfig { name: String, reason: String },
+    /// Too many middleware configurations are attached to one policy.
+    TooManyMiddlewareConfigs { count: usize },
+    /// Two middleware configurations use the same execution order.
+    DuplicateMiddlewareOrder {
+        order: i32,
+        first_name: String,
+        second_name: String,
+    },
+    /// Too many include and exclude patterns are attached to one middleware.
+    TooManyMiddlewareSelectorPatterns { name: String, count: usize },
+    /// A middleware selector conflicts with an endpoint that skips TLS inspection.
+    MiddlewareTlsSkipConflict {
+        middleware_name: String,
+        policy_name: String,
+        host: String,
+    },
 }
 
 impl fmt::Display for PolicyViolation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidProcessIdentity { field, value } => {
-                write!(f, "{field} must be 'sandbox', got '{value}'")
+                write!(
+                    f,
+                    "{field} must be 'sandbox' or a numeric UID/GID in range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}], got '{value}'"
+                )
             }
             Self::PathTraversal { path } => {
                 write!(f, "path contains '..' traversal component: {path}")
@@ -730,6 +1238,77 @@ impl fmt::Display for PolicyViolation {
                      use subdomain wildcards like '*.example.com' instead"
                 )
             }
+            Self::InvalidHostWildcard { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': invalid host wildcard '{host}'; \
+                     middle DNS label wildcards must be the entire label '*' and recursive '**' \
+                     is only allowed as the entire first label"
+                )
+            }
+            Self::MissingSigningService { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' has credential_signing \
+                     set but signing_service is empty"
+                )
+            }
+            Self::UnknownCredentialSigning {
+                policy_name,
+                host,
+                value,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' has unrecognized \
+                     credential_signing value '{value}' (expected sigv4, sigv4:body, or sigv4:no_body)"
+                )
+            }
+            Self::CredentialSigningWithBodyRewrite { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' has both credential_signing \
+                     and request_body_credential_rewrite set; these options are mutually exclusive"
+                )
+            }
+            Self::InvalidMiddlewareConfig { name, reason } => {
+                write!(f, "middleware config '{name}' is invalid: {reason}")
+            }
+            Self::TooManyMiddlewareConfigs { count } => {
+                write!(
+                    f,
+                    "too many middleware configs ({count} > {})",
+                    openshell_core::middleware::MAX_MIDDLEWARE_CONFIGS
+                )
+            }
+            Self::DuplicateMiddlewareOrder {
+                order,
+                first_name,
+                second_name,
+            } => {
+                write!(
+                    f,
+                    "middleware configs '{first_name}' and '{second_name}' use duplicate order {order}"
+                )
+            }
+            Self::TooManyMiddlewareSelectorPatterns { name, count } => {
+                write!(
+                    f,
+                    "middleware config '{name}' has too many selector patterns ({count} > {})",
+                    openshell_core::middleware::MAX_MIDDLEWARE_SELECTOR_PATTERNS
+                )
+            }
+            Self::MiddlewareTlsSkipConflict {
+                middleware_name,
+                policy_name,
+                host,
+            } => {
+                write!(
+                    f,
+                    "middleware config '{middleware_name}' selects network policy \
+                     '{policy_name}' tls: skip endpoint '{host}'"
+                )
+            }
         }
     }
 }
@@ -741,29 +1320,32 @@ impl fmt::Display for PolicyViolation {
 /// error vs. logged warning).
 ///
 /// Checks performed:
-/// - `run_as_user` / `run_as_group` must be "sandbox"
+/// - Explicit `run_as_user` / `run_as_group` fields must be safe identities
 /// - Filesystem paths must be absolute (start with `/`)
 /// - Filesystem paths must not contain `..` components
 /// - Read-write paths must not be overly broad (just `/`)
 /// - Individual path lengths must not exceed [`MAX_PATH_LENGTH`]
 /// - Total path count must not exceed [`MAX_FILESYSTEM_PATHS`]
 /// - Network endpoint hosts must not use TLD wildcards (e.g. `*.com`)
+/// - Middleware names, implementations, failure modes, selectors, and built-in
+///   configurations must be valid
+/// - Middleware selectors must not match endpoints that skip TLS inspection
 pub fn validate_sandbox_policy(
     policy: &SandboxPolicy,
 ) -> std::result::Result<(), Vec<PolicyViolation>> {
     let mut violations = Vec::new();
 
-    // Check process identity — must be "sandbox".
-    // `ensure_sandbox_process_identity` should be called before this to
-    // fill in defaults; anything other than "sandbox" is rejected.
+    // Omitted process identity fields are resolved by the compute runtime.
+    // Explicit fields must be "sandbox" or a numeric UID/GID within the
+    // acceptable sandbox range.
     if let Some(ref process) = policy.process {
-        if process.run_as_user != "sandbox" {
+        if !process.run_as_user.is_empty() && !is_valid_sandbox_identity(&process.run_as_user) {
             violations.push(PolicyViolation::InvalidProcessIdentity {
                 field: "run_as_user",
                 value: process.run_as_user.clone(),
             });
         }
-        if process.run_as_group != "sandbox" {
+        if !process.run_as_group.is_empty() && !is_valid_sandbox_identity(&process.run_as_group) {
             violations.push(PolicyViolation::InvalidProcessIdentity {
                 field: "run_as_group",
                 value: process.run_as_group.clone(),
@@ -834,8 +1416,40 @@ pub fn validate_sandbox_policy(
                     });
                 }
             }
+            if host_wildcard_shape_invalid(&ep.host) {
+                violations.push(PolicyViolation::InvalidHostWildcard {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                });
+            }
+            if !ep.credential_signing.is_empty()
+                && !matches!(
+                    ep.credential_signing.as_str(),
+                    "sigv4" | "sigv4:body" | "sigv4:no_body"
+                )
+            {
+                violations.push(PolicyViolation::UnknownCredentialSigning {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                    value: ep.credential_signing.clone(),
+                });
+            }
+            if !ep.credential_signing.is_empty() && ep.signing_service.is_empty() {
+                violations.push(PolicyViolation::MissingSigningService {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                });
+            }
+            if !ep.credential_signing.is_empty() && ep.request_body_credential_rewrite {
+                violations.push(PolicyViolation::CredentialSigningWithBodyRewrite {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                });
+            }
         }
     }
+
+    violations.extend(middleware::validate(policy));
 
     if violations.is_empty() {
         Ok(())
@@ -844,12 +1458,37 @@ pub fn validate_sandbox_policy(
     }
 }
 
+fn host_wildcard_shape_invalid(host: &str) -> bool {
+    if host == "*" || host == "**" {
+        return true;
+    }
+    if !host.contains('*') {
+        return false;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let first_label = labels.first().copied().unwrap_or_default();
+    if first_label.contains("**") && first_label != "**" {
+        return true;
+    }
+    labels
+        .iter()
+        .skip(1)
+        .copied()
+        .any(|label| label.contains("**") || (label.contains('*') && label != "*"))
+}
+
 /// Truncate a string for safe inclusion in error messages.
 fn truncate_for_display(s: &str) -> String {
     if s.len() <= 80 {
         s.to_string()
     } else {
-        format!("{}...", &s[..77])
+        // Back off to a char boundary: slicing at a fixed byte index panics
+        // on multi-byte UTF-8 (e.g. non-ASCII characters in policy paths).
+        let mut end = 77;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
     }
 }
 
@@ -858,26 +1497,10 @@ fn truncate_for_display(s: &str) -> String {
 ///
 /// This is a lexical normalization only — it does NOT resolve symlinks or
 /// check the filesystem.
-pub fn normalize_path(path: &str) -> String {
-    use std::path::Component;
-
-    let p = Path::new(path);
-    let mut normalized = std::path::PathBuf::new();
-    for component in p.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            #[allow(clippy::path_buf_push_overwrite)]
-            Component::RootDir => normalized.push("/"),
-            Component::CurDir => {} // skip "."
-            Component::ParentDir => {
-                // Keep ".." — validation will catch it separately
-                normalized.push("..");
-            }
-            Component::Normal(c) => normalized.push(c),
-        }
-    }
-    normalized.to_string_lossy().to_string()
-}
+///
+/// Re-exported from `openshell-core` so existing call sites
+/// (`openshell_policy::normalize_path`) keep resolving.
+pub use openshell_core::paths::normalize_path;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -886,6 +1509,21 @@ pub fn normalize_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_for_display_handles_multi_byte_utf8_without_panicking() {
+        // Byte index 77 falls inside the multi-byte 'é'.
+        let s = format!("/{}{}", "a".repeat(75), "é".repeat(100));
+        let truncated = truncate_for_display(&s);
+        assert!(truncated.ends_with("..."));
+        assert!(truncated.len() <= 80);
+    }
+
+    #[test]
+    fn truncate_for_display_leaves_short_strings_untouched() {
+        let s = "short path";
+        assert_eq!(truncate_for_display(s), s);
+    }
 
     /// Verify that the serialized YAML uses `filesystem_policy` (not
     /// `filesystem`) so it can be fed back to `parse_sandbox_policy`.
@@ -977,6 +1615,69 @@ network_policies:
     }
 
     #[test]
+    fn round_trip_preserves_network_middlewares() {
+        let yaml = r#"
+version: 1
+network_middlewares:
+  global-redactor:
+    name: Global redactor
+    middleware: openshell/regex
+    order: 20
+    on_error: fail_open
+    endpoints:
+      include: ["api.example.com", "*.service.test"]
+      exclude: ["internal.example.com"]
+    config:
+      mode: redact
+  secondary-redactor:
+    middleware: openshell/regex
+    endpoints:
+      include: ["api.example.com"]
+network_policies:
+  api:
+    name: api
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+    binaries:
+      - path: /usr/bin/curl
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        assert_eq!(proto.network_middlewares.len(), 2);
+        let redactor = &proto.network_middlewares["global-redactor"];
+        assert_eq!(redactor.name, "Global redactor");
+        assert_eq!(redactor.middleware, "openshell/regex");
+        assert_eq!(redactor.order, 20);
+        assert_eq!(redactor.on_error, "fail_open");
+        assert_eq!(
+            redactor.endpoints.as_ref().expect("selector").include,
+            vec!["api.example.com", "*.service.test"]
+        );
+        assert_eq!(
+            redactor.endpoints.as_ref().expect("selector").exclude,
+            vec!["internal.example.com"]
+        );
+        assert_eq!(
+            redactor
+                .config
+                .as_ref()
+                .expect("config")
+                .fields
+                .get("mode")
+                .and_then(|value| value.kind.as_ref()),
+            Some(&prost_types::value::Kind::StringValue("redact".into()))
+        );
+        assert_eq!(
+            proto.network_middlewares["secondary-redactor"].name,
+            "secondary-redactor"
+        );
+        let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
+        let reparsed = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        assert_eq!(reparsed.network_middlewares, proto.network_middlewares);
+    }
+
+    #[test]
     fn restrictive_default_has_no_network_policies() {
         let policy = restrictive_default_policy();
         assert!(
@@ -995,8 +1696,8 @@ network_policies:
             "read_only should contain /usr"
         );
         assert!(
-            fs.read_write.iter().any(|p| p == "/sandbox"),
-            "read_write should contain /sandbox"
+            !fs.read_write.iter().any(|p| p == "/sandbox"),
+            "the workspace should be granted through include_workdir, not a literal /sandbox path"
         );
         assert!(
             fs.read_write.iter().any(|p| p == "/tmp"),
@@ -1005,11 +1706,9 @@ network_policies:
     }
 
     #[test]
-    fn restrictive_default_has_process_identity() {
+    fn restrictive_default_omits_process_identity() {
         let policy = restrictive_default_policy();
-        let proc = policy.process.expect("must have process policy");
-        assert_eq!(proc.run_as_user, "sandbox");
-        assert_eq!(proc.run_as_group, "sandbox");
+        assert!(policy.process.is_none());
     }
 
     #[test]
@@ -1032,6 +1731,46 @@ network_policies:
         assert_eq!(policy.version, 1);
         assert!(policy.network_policies.is_empty());
         assert!(policy.filesystem.is_none());
+    }
+
+    #[test]
+    fn process_identity_omission_survives_yaml_round_trip() {
+        let policy = parse_sandbox_policy("version: 1\nprocess:\n  run_as_user: \"1234\"\n")
+            .expect("partial process identity should parse");
+        let process = policy.process.as_ref().expect("process section");
+        assert_eq!(process.run_as_user, "1234");
+        assert!(process.run_as_group.is_empty());
+        assert!(validate_sandbox_policy(&policy).is_ok());
+
+        let yaml = serialize_sandbox_policy(&policy).expect("partial identity should serialize");
+        assert!(yaml.contains("run_as_user"));
+        assert!(!yaml.contains("run_as_group"));
+        let reparsed = parse_sandbox_policy(&yaml).expect("round trip should parse");
+        assert!(reparsed.process.unwrap().run_as_group.is_empty());
+    }
+
+    #[test]
+    fn ensure_sandbox_process_identity_fills_each_omitted_field() {
+        let cases = [
+            (None, None, "sandbox", "sandbox"),
+            (Some("1234"), None, "1234", "sandbox"),
+            (None, Some("1235"), "sandbox", "1235"),
+            (Some("1234"), Some("1235"), "1234", "1235"),
+        ];
+
+        for (user, group, expected_user, expected_group) in cases {
+            let mut policy = restrictive_default_policy();
+            policy.process = Some(ProcessPolicy {
+                run_as_user: user.unwrap_or_default().to_string(),
+                run_as_group: group.unwrap_or_default().to_string(),
+            });
+
+            ensure_sandbox_process_identity(&mut policy);
+
+            let process = policy.process.expect("normalized process policy");
+            assert_eq!(process.run_as_user, expected_user);
+            assert_eq!(process.run_as_group, expected_group);
+        }
     }
 
     #[test]
@@ -1107,35 +1846,57 @@ network_policies:
     }
 
     #[test]
-    fn ensure_sandbox_process_identity_fills_defaults() {
-        let mut policy = restrictive_default_policy();
-        policy.process = None;
-        ensure_sandbox_process_identity(&mut policy);
-        let proc = policy.process.unwrap();
-        assert_eq!(proc.run_as_user, "sandbox");
-        assert_eq!(proc.run_as_group, "sandbox");
+    fn parse_rejects_middleware_attachments_on_network_policies_and_endpoints() {
+        let policy_attachment = r"
+version: 1
+network_policies:
+  api:
+    middleware: [redact]
+    endpoints:
+      - host: api.example.com
+        port: 443
+";
+        assert!(parse_sandbox_policy(policy_attachment).is_err());
+
+        let endpoint_attachment = r"
+version: 1
+network_policies:
+  api:
+    endpoints:
+      - host: api.example.com
+        port: 443
+        middleware: [redact]
+";
+        assert!(parse_sandbox_policy(endpoint_attachment).is_err());
     }
 
     #[test]
-    fn ensure_sandbox_process_identity_fills_empty_strings() {
-        let mut policy = restrictive_default_policy();
-        policy.process = Some(ProcessPolicy {
-            run_as_user: String::new(),
-            run_as_group: String::new(),
-        });
-        ensure_sandbox_process_identity(&mut policy);
-        let proc = policy.process.unwrap();
-        assert_eq!(proc.run_as_user, "sandbox");
-        assert_eq!(proc.run_as_group, "sandbox");
-    }
+    fn l7_config_stanza_runtime_fields_use_canonical_schema() {
+        let fields = l7_config_alias_runtime_fields(
+            L7ConfigStanza::Mcp,
+            serde_json::json!({
+                "max_body_bytes": 131_072,
+                "strict_tool_names": false,
+                "allow_all_known_mcp_methods": true
+            }),
+        )
+        .expect("valid mcp config");
 
-    #[test]
-    fn ensure_sandbox_process_identity_preserves_sandbox() {
-        let mut policy = restrictive_default_policy();
-        ensure_sandbox_process_identity(&mut policy);
-        let proc = policy.process.unwrap();
-        assert_eq!(proc.run_as_user, "sandbox");
-        assert_eq!(proc.run_as_group, "sandbox");
+        assert_eq!(
+            fields,
+            vec![
+                ("json_rpc_max_body_bytes", serde_json::json!(131_072)),
+                ("mcp_strict_tool_names", serde_json::json!(false)),
+                ("mcp_allow_all_known_mcp_methods", serde_json::json!(true)),
+            ]
+        );
+
+        let err = l7_config_alias_runtime_fields(
+            L7ConfigStanza::JsonRpc,
+            serde_json::json!({"on_parse_error": "allow"}),
+        )
+        .expect_err("unknown JSON-RPC config fields must be rejected");
+        assert!(err.to_string().contains("on_parse_error"));
     }
 
     #[test]
@@ -1149,6 +1910,101 @@ network_policies:
     }
 
     // ---- Policy validation tests ----
+
+    fn middleware_config(implementation: &str) -> openshell_core::proto::NetworkMiddlewareConfig {
+        openshell_core::proto::NetworkMiddlewareConfig {
+            name: String::new(),
+            middleware: implementation.into(),
+            order: 0,
+            config: None,
+            on_error: String::new(),
+            endpoints: Some(openshell_core::proto::MiddlewareEndpointSelector {
+                include: vec!["api.example.com".into()],
+                exclude: Vec::new(),
+            }),
+        }
+    }
+
+    fn add_middleware(
+        policy: &mut SandboxPolicy,
+        name: &str,
+        config: openshell_core::proto::NetworkMiddlewareConfig,
+    ) {
+        policy.network_middlewares.insert(name.into(), config);
+    }
+
+    #[test]
+    fn structural_validation_defers_implementation_owned_config() {
+        let mut policy = restrictive_default_policy();
+        let mut middleware = middleware_config("openshell/future");
+        middleware.config = Some(
+            openshell_core::proto_struct::json_object_to_struct(
+                std::iter::once(("implementation_field".into(), serde_json::json!(42))).collect(),
+            )
+            .unwrap(),
+        );
+        policy
+            .network_middlewares
+            .insert("future".into(), middleware);
+
+        validate_sandbox_policy(&policy)
+            .expect("generic policy validation must not select installed implementations");
+    }
+
+    #[test]
+    fn json_validation_delegates_implementation_owned_config() {
+        let data = serde_json::json!({
+            "network_middlewares": {
+              "future": {
+                "middleware": "openshell/future",
+                "config": {"implementation_field": 42},
+                "endpoints": {"include": ["api.example.com"]}
+              }
+            }
+        });
+
+        let violations =
+            validate_network_middleware_json_with_config(&data, |implementation, _config| {
+                Err(format!("{implementation} is not installed"))
+            })
+            .expect("parse middleware policy");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::InvalidMiddlewareConfig { name, reason }
+                if name == "future" && reason.contains("not installed")
+        )));
+    }
+
+    #[test]
+    fn json_validation_skips_config_callbacks_when_middleware_count_is_invalid() {
+        let configs: serde_json::Map<String, serde_json::Value> = (0
+            ..=openshell_core::middleware::MAX_MIDDLEWARE_CONFIGS)
+            .map(|index| {
+                (
+                    format!("middleware-{index}"),
+                    serde_json::json!({
+                        "middleware": "openshell/regex",
+                        "endpoints": {"include": ["api.example.com"]}
+                    }),
+                )
+            })
+            .collect();
+        let data = serde_json::json!({"network_middlewares": configs});
+        let calls = std::cell::Cell::new(0usize);
+
+        let violations = validate_network_middleware_json_with_config(&data, |_, _| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        })
+        .expect("parse middleware policy");
+
+        assert_eq!(calls.get(), 0, "invalid policy must not invoke services");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::TooManyMiddlewareConfigs { count }
+                if *count == openshell_core::middleware::MAX_MIDDLEWARE_CONFIGS + 1
+        )));
+    }
 
     #[test]
     fn validate_rejects_root_run_as_user() {
@@ -1176,6 +2032,293 @@ network_policies:
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert_eq!(violations.len(), 2);
+    }
+
+    #[test]
+    fn validate_rejects_invalid_middleware_control_fields() {
+        let cases = [
+            (
+                "",
+                middleware_config("openshell/regex"),
+                "name must not be empty",
+            ),
+            (
+                "redactor",
+                middleware_config(""),
+                "middleware must not be empty",
+            ),
+            (
+                "redactor",
+                {
+                    let mut middleware = middleware_config("openshell/regex");
+                    middleware.on_error = "maybe".into();
+                    middleware
+                },
+                "invalid on_error",
+            ),
+            (
+                "redactor",
+                {
+                    let mut middleware = middleware_config("openshell/regex");
+                    middleware.endpoints = None;
+                    middleware
+                },
+                "endpoint selector is required",
+            ),
+            (
+                "redactor",
+                {
+                    let mut middleware = middleware_config("openshell/regex");
+                    middleware.endpoints.as_mut().unwrap().include.clear();
+                    middleware
+                },
+                "must include at least one host pattern",
+            ),
+        ];
+
+        for (name, middleware, expected) in cases {
+            let mut policy = restrictive_default_policy();
+            add_middleware(&mut policy, name, middleware);
+            let errors = validate_sandbox_policy(&policy)
+                .expect_err("invalid middleware must be rejected")
+                .into_iter()
+                .map(|violation| violation.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            assert!(
+                errors.contains(expected),
+                "expected {expected:?} in {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_middleware_orders() {
+        let mut policy = restrictive_default_policy();
+        let mut alpha = middleware_config("openshell/regex");
+        alpha.order = 10;
+        add_middleware(&mut policy, "alpha", alpha);
+        let mut beta = middleware_config("openshell/regex");
+        beta.order = 10;
+        add_middleware(&mut policy, "beta", beta);
+
+        let violations = validate_sandbox_policy(&policy).expect_err("duplicate order");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::DuplicateMiddlewareOrder {
+                order: 10,
+                first_name,
+                second_name,
+            } if first_name == "alpha" && second_name == "beta"
+        )));
+    }
+
+    #[test]
+    fn validate_accepts_maximum_middleware_configs() {
+        let mut policy = restrictive_default_policy();
+        for index in 0..openshell_core::middleware::MAX_MIDDLEWARE_CONFIGS {
+            let name = format!("middleware-{index}");
+            let mut config = middleware_config("openshell/regex");
+            config.order = i32::try_from(index).unwrap();
+            add_middleware(&mut policy, &name, config);
+        }
+
+        validate_sandbox_policy(&policy).expect("maximum middleware config count");
+    }
+
+    #[test]
+    fn validate_rejects_middleware_config_over_capacity() {
+        let mut policy = restrictive_default_policy();
+        for index in 0..=openshell_core::middleware::MAX_MIDDLEWARE_CONFIGS {
+            let name = format!("middleware-{index}");
+            let mut config = middleware_config("openshell/regex");
+            config.order = i32::try_from(index).unwrap();
+            add_middleware(&mut policy, &name, config);
+        }
+
+        let violations = validate_sandbox_policy(&policy).expect_err("config count over capacity");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::TooManyMiddlewareConfigs { count }
+                if *count == openshell_core::middleware::MAX_MIDDLEWARE_CONFIGS + 1
+        )));
+    }
+
+    #[test]
+    fn validate_accepts_maximum_middleware_selector_patterns() {
+        let mut policy = restrictive_default_policy();
+        let mut middleware = middleware_config("openshell/regex");
+        let selector = middleware.endpoints.as_mut().expect("selector");
+        selector.exclude = vec![
+            "excluded.example.com".into();
+            openshell_core::middleware::MAX_MIDDLEWARE_SELECTOR_PATTERNS - 1
+        ];
+        add_middleware(&mut policy, "redactor", middleware);
+
+        validate_sandbox_policy(&policy).expect("maximum selector pattern count");
+    }
+
+    #[test]
+    fn validate_rejects_middleware_selector_patterns_over_capacity() {
+        let mut policy = restrictive_default_policy();
+        let mut middleware = middleware_config("openshell/regex");
+        let selector = middleware.endpoints.as_mut().expect("selector");
+        selector.exclude = vec![
+            "excluded.example.com".into();
+            openshell_core::middleware::MAX_MIDDLEWARE_SELECTOR_PATTERNS
+        ];
+        add_middleware(&mut policy, "redactor", middleware);
+
+        let violations =
+            validate_sandbox_policy(&policy).expect_err("selector patterns over capacity");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::TooManyMiddlewareSelectorPatterns { name, count }
+                if name == "redactor"
+                    && *count
+                        == openshell_core::middleware::MAX_MIDDLEWARE_SELECTOR_PATTERNS + 1
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_malformed_middleware_selector_patterns() {
+        let mut policy = restrictive_default_policy();
+        let mut middleware = middleware_config("openshell/regex");
+        middleware.endpoints.as_mut().unwrap().include = vec!["api[.example.com".into()];
+        add_middleware(&mut policy, "redactor", middleware);
+
+        let errors = validate_sandbox_policy(&policy)
+            .expect_err("malformed selector")
+            .into_iter()
+            .map(|violation| violation.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(errors.contains("invalid host pattern"), "{errors}");
+    }
+
+    #[test]
+    fn middleware_host_selector_matching_is_case_insensitive() {
+        assert!(middleware_host_matches("*.Example.COM", "API.example.com").unwrap());
+        assert!(!middleware_host_matches("*.example.com", "example.com").unwrap());
+        assert!(!middleware_host_matches("*.example.com", "deep.api.example.com").unwrap());
+        assert!(middleware_host_matches("**.example.com", "deep.api.example.com").unwrap());
+        assert!(!middleware_host_matches("**.example.com", "example.com").unwrap());
+    }
+
+    #[test]
+    fn validate_rejects_middleware_selector_matching_tls_skip_endpoint() {
+        let mut policy = restrictive_default_policy();
+        add_middleware(
+            &mut policy,
+            "redactor",
+            middleware_config("openshell/regex"),
+        );
+        policy.network_policies.insert(
+            "api".into(),
+            NetworkPolicyRule {
+                name: "api".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    tls: "skip".into(),
+                    ..Default::default()
+                }],
+                binaries: Vec::new(),
+            },
+        );
+
+        let violations = validate_sandbox_policy(&policy).expect_err("tls skip conflict");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::MiddlewareTlsSkipConflict {
+                middleware_name,
+                policy_name,
+                host,
+            } if middleware_name == "redactor" && policy_name == "api" && host == "api.example.com"
+        )));
+    }
+
+    #[test]
+    fn validate_accepts_fail_open_middleware_selector_matching_tls_skip_endpoint() {
+        let mut policy = restrictive_default_policy();
+        let mut middleware = middleware_config("openshell/regex");
+        middleware.on_error = "fail_open".into();
+        add_middleware(&mut policy, "redactor", middleware);
+        policy.network_policies.insert(
+            "api".into(),
+            NetworkPolicyRule {
+                name: "api".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    tls: "skip".into(),
+                    ..Default::default()
+                }],
+                binaries: Vec::new(),
+            },
+        );
+
+        validate_sandbox_policy(&policy)
+            .expect("fail-open middleware may select uninspectable tls: skip traffic");
+    }
+
+    #[test]
+    fn validate_rejects_explicit_fail_closed_middleware_on_tls_skip_endpoint() {
+        let mut policy = restrictive_default_policy();
+        let mut middleware = middleware_config("openshell/regex");
+        middleware.on_error = "fail_closed".into();
+        add_middleware(&mut policy, "redactor", middleware);
+        policy.network_policies.insert(
+            "api".into(),
+            NetworkPolicyRule {
+                name: "api".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    tls: "skip".into(),
+                    ..Default::default()
+                }],
+                binaries: Vec::new(),
+            },
+        );
+
+        let violations = validate_sandbox_policy(&policy).expect_err("tls skip conflict");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::MiddlewareTlsSkipConflict { middleware_name, .. }
+                if middleware_name == "redactor"
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_concrete_selector_overlapping_tls_skip_wildcard() {
+        let mut policy = restrictive_default_policy();
+        let mut middleware = middleware_config("openshell/regex");
+        middleware.endpoints.as_mut().unwrap().include = vec!["api.example.com".into()];
+        add_middleware(&mut policy, "redactor", middleware);
+        policy.network_policies.insert(
+            "api".into(),
+            NetworkPolicyRule {
+                name: "api".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.example.com".into(),
+                    port: 443,
+                    tls: "skip".into(),
+                    ..Default::default()
+                }],
+                binaries: Vec::new(),
+            },
+        );
+
+        let violations = validate_sandbox_policy(&policy).expect_err("tls skip conflict");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::MiddlewareTlsSkipConflict {
+                middleware_name,
+                policy_name,
+                host,
+            } if middleware_name == "redactor" && policy_name == "api" && host == "*.example.com"
+        )));
     }
 
     #[test]
@@ -1262,19 +2405,31 @@ network_policies:
             filesystem: None,
             landlock: None,
             network_policies: HashMap::new(),
+            network_middlewares: HashMap::default(),
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
 
     #[test]
-    fn validate_rejects_empty_run_as_user() {
+    fn validate_accepts_omitted_process_fields() {
         let mut policy = restrictive_default_policy();
         policy.process = Some(ProcessPolicy {
             run_as_user: String::new(),
             run_as_group: String::new(),
         });
-        let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert_eq!(violations.len(), 2);
+        assert!(validate_sandbox_policy(&policy).is_ok());
+
+        policy.process = Some(ProcessPolicy {
+            run_as_user: "sandbox".into(),
+            run_as_group: String::new(),
+        });
+        assert!(validate_sandbox_policy(&policy).is_ok());
+
+        policy.process = Some(ProcessPolicy {
+            run_as_user: String::new(),
+            run_as_group: "1234".into(),
+        });
+        assert!(validate_sandbox_policy(&policy).is_ok());
     }
 
     #[test]
@@ -1358,6 +2513,33 @@ network_policies:
     }
 
     #[test]
+    fn validate_rejects_all_host_star_wildcards() {
+        for host in ["*", "**"] {
+            let mut policy = restrictive_default_policy();
+            policy.network_policies.insert(
+                "bad".into(),
+                NetworkPolicyRule {
+                    name: "bad-rule".into(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: host.into(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+
+            let violations = validate_sandbox_policy(&policy).unwrap_err();
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| matches!(v, PolicyViolation::InvalidHostWildcard { .. })),
+                "expected bare host wildcard {host:?} to be rejected, got {violations:?}"
+            );
+        }
+    }
+
+    #[test]
     fn validate_accepts_subdomain_wildcard() {
         let mut policy = restrictive_default_policy();
         policy.network_policies.insert(
@@ -1376,6 +2558,47 @@ network_policies:
     }
 
     #[test]
+    fn validate_accepts_middle_label_star_wildcard() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "ok".into(),
+            NetworkPolicyRule {
+                name: "ok-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.s3.*.amazonaws.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_partial_middle_label_wildcard() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "bad".into(),
+            NetworkPolicyRule {
+                name: "bad-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.s3.us-*.amazonaws.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::InvalidHostWildcard { .. }))
+        );
+    }
+
+    #[test]
     fn validate_accepts_explicit_domain() {
         let mut policy = restrictive_default_policy();
         policy.network_policies.insert(
@@ -1391,6 +2614,167 @@ network_policies:
             },
         );
         assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_credential_signing_without_signing_service() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "bedrock".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "bedrock-runtime.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4".into(),
+                    signing_service: String::new(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::MissingSigningService { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_accepts_credential_signing_with_signing_service() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "bedrock".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "bedrock-runtime.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4".into(),
+                    signing_service: "bedrock".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_sigv4_body_with_signing_service() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "bedrock".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "bedrock-runtime.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4:body".into(),
+                    signing_service: "bedrock".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_sigv4_no_body_with_signing_service() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "s3".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "s3.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4:no_body".into(),
+                    signing_service: "s3".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_sigv4_no_body_without_signing_service() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "s3".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "s3.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4:no_body".into(),
+                    signing_service: String::new(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::MissingSigningService { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_credential_signing() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "test".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "example.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4_typo".into(),
+                    signing_service: "bedrock".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::UnknownCredentialSigning { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_credential_signing_with_body_rewrite() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "bedrock".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "bedrock-runtime.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4".into(),
+                    signing_service: "bedrock".into(),
+                    request_body_credential_rewrite: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::CredentialSigningWithBodyRewrite { .. }))
+        );
     }
 
     #[test]
@@ -1416,6 +2800,173 @@ network_policies:
         assert!(s.contains("root"));
         assert!(s.contains("run_as_user"));
         assert!(s.contains("sandbox"));
+    }
+
+    // ---- is_valid_sandbox_identity tests ----
+
+    #[test]
+    fn valid_identity_accepts_sandbox() {
+        assert!(is_valid_sandbox_identity("sandbox"));
+    }
+
+    #[test]
+    fn valid_identity_accepts_non_root_numeric_uid() {
+        assert!(is_valid_sandbox_identity("1"));
+        assert!(is_valid_sandbox_identity("30"));
+        assert!(is_valid_sandbox_identity("500"));
+        assert!(is_valid_sandbox_identity("999"));
+        assert!(is_valid_sandbox_identity("1000"));
+        assert!(is_valid_sandbox_identity("50000"));
+        assert!(is_valid_sandbox_identity("1000660000"));
+    }
+
+    #[test]
+    fn valid_identity_accepts_boundary_uids() {
+        assert!(is_valid_sandbox_identity(&MIN_SANDBOX_UID.to_string()));
+        assert!(is_valid_sandbox_identity(&MAX_SANDBOX_UID.to_string()));
+    }
+
+    #[test]
+    fn valid_identity_rejects_zero() {
+        assert!(!is_valid_sandbox_identity("0"));
+    }
+
+    #[test]
+    fn valid_identity_rejects_invalid_uid_sentinel() {
+        assert!(!is_valid_sandbox_identity(
+            &MAX_SANDBOX_UID.saturating_add(1).to_string()
+        ));
+    }
+
+    #[test]
+    fn valid_identity_rejects_non_numeric_names() {
+        assert!(!is_valid_sandbox_identity("root"));
+        assert!(!is_valid_sandbox_identity("nobody"));
+        assert!(!is_valid_sandbox_identity("user"));
+    }
+
+    #[test]
+    fn valid_identity_rejects_empty_string() {
+        assert!(!is_valid_sandbox_identity(""));
+    }
+
+    // ---- Policy validation with numeric UIDs ----
+
+    #[test]
+    fn validate_accepts_numeric_uid_in_range() {
+        let policy = SandboxPolicy {
+            version: 1,
+            process: Some(ProcessPolicy {
+                run_as_user: "1000".into(),
+                run_as_group: "5000".into(),
+            }),
+            filesystem: None,
+            landlock: None,
+            network_policies: HashMap::new(),
+            network_middlewares: HashMap::default(),
+        };
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_boundary_uids() {
+        let policy = SandboxPolicy {
+            version: 1,
+            process: Some(ProcessPolicy {
+                run_as_user: MIN_SANDBOX_UID.to_string(),
+                run_as_group: MAX_SANDBOX_UID.to_string(),
+            }),
+            filesystem: None,
+            landlock: None,
+            network_policies: HashMap::new(),
+            network_middlewares: HashMap::default(),
+        };
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_non_root_system_uid() {
+        let mut policy = restrictive_default_policy();
+        policy.process = Some(ProcessPolicy {
+            run_as_user: "500".into(),
+            run_as_group: "30".into(),
+        });
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_uid_out_of_range_high() {
+        let mut policy = restrictive_default_policy();
+        policy.process = Some(ProcessPolicy {
+            run_as_user: (MAX_SANDBOX_UID + 1).to_string(),
+            run_as_group: "sandbox".into(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(violations.iter().any(|v| matches!(
+            v,
+            PolicyViolation::InvalidProcessIdentity {
+                field: "run_as_user",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_root_string() {
+        let mut policy = restrictive_default_policy();
+        policy.process = Some(ProcessPolicy {
+            run_as_user: "root".into(),
+            run_as_group: "sandbox".into(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(violations.iter().any(|v| matches!(
+            v,
+            PolicyViolation::InvalidProcessIdentity {
+                field: "run_as_user",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_nobody_string() {
+        let mut policy = restrictive_default_policy();
+        policy.process = Some(ProcessPolicy {
+            run_as_user: "nobody".into(),
+            run_as_group: "nogroup".into(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert_eq!(violations.len(), 2);
+    }
+
+    #[test]
+    fn validate_accepts_mixed_sandbox_name_and_uid() {
+        // run_as_user as "sandbox" name, run_as_group as numeric UID
+        let policy = SandboxPolicy {
+            version: 1,
+            process: Some(ProcessPolicy {
+                run_as_user: "sandbox".into(),
+                run_as_group: "1000".into(),
+            }),
+            filesystem: None,
+            landlock: None,
+            network_policies: HashMap::new(),
+            network_middlewares: HashMap::default(),
+        };
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn policy_violation_display_includes_range() {
+        let v = PolicyViolation::InvalidProcessIdentity {
+            field: "run_as_user",
+            value: "root".into(),
+        };
+        let s = format!("{v}");
+        assert!(s.contains("sandbox"));
+        assert!(s.contains(&MIN_SANDBOX_UID.to_string()));
+        assert!(s.contains(&MAX_SANDBOX_UID.to_string()));
+        assert!(s.contains("root"));
     }
 
     // ---- Multi-port and host wildcard tests ----
@@ -1483,6 +3034,37 @@ network_policies:
         let ep2 = &proto2.network_policies["test"].endpoints[0];
         assert_eq!(ep1.path, "/graphql");
         assert_eq!(ep1.path, ep2.path);
+    }
+
+    #[test]
+    fn round_trip_preserves_endpoint_credential_binding() {
+        let yaml = r"
+version: 1
+network_policies:
+  gcp_storage:
+    endpoints:
+      - host: storage.googleapis.com
+        port: 443
+        protocol: rest
+        credential_binding:
+          provider: work-gcp
+";
+
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let endpoint = &proto1.network_policies["gcp_storage"].endpoints[0];
+        assert_eq!(
+            endpoint
+                .credential_binding
+                .as_ref()
+                .map(|binding| binding.provider.as_str()),
+            Some("work-gcp")
+        );
+
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        assert_eq!(proto1, proto2);
+        assert!(yaml_out.contains("credential_binding:"));
+        assert!(yaml_out.contains("provider: work-gcp"));
     }
 
     #[test]
@@ -1716,6 +3298,155 @@ network_policies:
     }
 
     #[test]
+    fn round_trip_preserves_json_rpc_max_body_bytes() {
+        let yaml = r"
+version: 1
+network_policies:
+  jsonrpc_api:
+    name: jsonrpc_api
+    endpoints:
+      - host: jsonrpc.example.com
+        port: 443
+        protocol: json-rpc
+        enforcement: enforce
+        json_rpc:
+          max_body_bytes: 131072
+        rules:
+          - allow:
+              method: initialize
+    binaries:
+      - path: /usr/bin/curl
+";
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep = &proto2.network_policies["jsonrpc_api"].endpoints[0];
+        assert_eq!(ep.protocol, "json-rpc");
+        assert_eq!(ep.json_rpc_max_body_bytes, 131_072);
+    }
+
+    #[test]
+    fn parse_mcp_rules_to_runtime_fields() {
+        let yaml = r"
+version: 1
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        mcp:
+          max_body_bytes: 131072
+          strict_tool_names: false
+        rules:
+          - allow:
+              method: initialize
+          - allow:
+              method: tools/list
+          - allow:
+              method: tools/call
+              tool:
+                any: [search_web, list_tools]
+        deny_rules:
+          - method: tools/call
+            tool: send_email
+    binaries:
+      - path: /usr/bin/curl
+";
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        let ep = &proto.network_policies["mcp"].endpoints[0];
+
+        assert_eq!(ep.protocol, "mcp");
+        assert_eq!(ep.json_rpc_max_body_bytes, 131_072);
+        assert_eq!(
+            ep.mcp
+                .as_ref()
+                .and_then(|options| options.strict_tool_names),
+            Some(false)
+        );
+        assert_eq!(ep.rules.len(), 3);
+        assert_eq!(ep.rules[2].allow.as_ref().unwrap().method, "tools/call");
+        assert_eq!(
+            ep.rules[2].allow.as_ref().unwrap().params["name"].any,
+            vec!["search_web".to_string(), "list_tools".to_string()]
+        );
+        assert_eq!(ep.deny_rules.len(), 1);
+        assert_eq!(ep.deny_rules[0].method, "tools/call");
+        assert_eq!(ep.deny_rules[0].params["name"].glob, "send_email");
+    }
+
+    #[test]
+    fn round_trip_mcp_policy_serializes_mcp_expression() {
+        let yaml = r"
+version: 1
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: mcp
+        mcp:
+          max_body_bytes: 131072
+          strict_tool_names: false
+        rules:
+          - allow:
+              method: tools/call
+              tool: search_web
+        deny_rules:
+          - method: tools/call
+            tool:
+              any: [send_email, delete_resource]
+    binaries:
+      - path: /usr/bin/curl
+";
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        assert!(yaml_out.contains("protocol: mcp"));
+        assert!(yaml_out.contains("method: tools/call"));
+        assert!(yaml_out.contains("tool: search_web"));
+        assert!(yaml_out.contains("any:"));
+        assert!(yaml_out.contains("- send_email"));
+        assert!(yaml_out.contains("- delete_resource"));
+        assert!(yaml_out.contains("deny_rules:"));
+        assert!(!yaml_out.contains("arguments:"));
+        assert!(yaml_out.contains("mcp:"));
+        assert!(yaml_out.contains("strict_tool_names: false"));
+        assert_eq!(proto1, proto2);
+    }
+
+    #[test]
+    fn parse_rejects_unsupported_json_rpc_config_fields() {
+        let yaml = r"
+version: 1
+network_policies:
+  jsonrpc_api:
+    endpoints:
+      - host: jsonrpc.example.com
+        port: 443
+        protocol: json-rpc
+        json_rpc:
+          max_body_bytes: 131072
+          on_parse_error: deny
+          batch_policy: all
+        access: full
+    binaries:
+      - path: /usr/bin/curl
+";
+
+        assert!(
+            parse_sandbox_policy(yaml).is_err(),
+            "unsupported json_rpc fields must not be silently accepted"
+        );
+    }
+
+    #[test]
     fn round_trip_preserves_websocket_credential_rewrite() {
         let yaml = r"
 version: 1
@@ -1770,6 +3501,32 @@ network_policies:
     }
 
     #[test]
+    fn round_trip_preserves_allow_uninspected_credentials() {
+        let yaml = r"
+version: 1
+network_policies:
+  vendor_api:
+    endpoints:
+      - host: api.vendor.example
+        port: 443
+        tls: skip
+        allow_uninspected_credentials: true
+";
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep = &proto2.network_policies["vendor_api"].endpoints[0];
+        assert!(ep.allow_uninspected_credentials);
+        assert!(
+            !ep.provider_credentialed,
+            "provider provenance must not be authorable from policy YAML"
+        );
+        assert!(yaml_out.contains("allow_uninspected_credentials: true"));
+        assert!(!yaml_out.contains("provider_credentialed"));
+    }
+
+    #[test]
     fn websocket_credential_rewrite_defaults_false() {
         let yaml = r"
 version: 1
@@ -1787,6 +3544,8 @@ network_policies:
         let ep = &proto.network_policies["gateway"].endpoints[0];
         assert!(!ep.websocket_credential_rewrite);
         assert!(!ep.request_body_credential_rewrite);
+        assert!(!ep.allow_uninspected_credentials);
+        assert!(!ep.provider_credentialed);
     }
 
     #[test]

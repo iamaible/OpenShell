@@ -194,10 +194,18 @@ during the first prepare.
 
 The driver also writes the accepted `DriverSandbox` launch request to
 `<state-dir>/sandboxes/<id>/sandbox.pb`. If the gateway restarts, it starts a
-new VM driver process; that process scans the sandbox state directories,
-restarts each persisted VM launcher, and preserves any existing `overlay.ext4`
-instead of cloning a fresh overlay template. If a restart happened before the
-overlay was created, the driver creates it during the resume attempt.
+new VM driver process. During graceful shutdown, the gateway first sends the
+shared `StopSandbox` request for each persisted running-intent sandbox, which
+stops its launcher while retaining the launch request and `overlay.ext4`.
+After driver initialization, the gateway sends the idempotent `StartSandbox`
+request for that retained intent. Explicitly stopped sandboxes remain excluded.
+
+Stop writes a marker in the sandbox state directory before terminating
+the launcher and releasing host GPU and network allocations. It retains
+`sandbox.pb`, `overlay.ext4`, and lifecycle-extension state. Startup registers
+marked sandboxes without launching compute. Start removes the marker and uses
+the normal persisted restore path with the existing overlay. Delete removes the
+entire sandbox state directory, including a stop marker and overlay.
 
 ## Logs and debugging
 
@@ -208,7 +216,7 @@ RUST_LOG=openshell_server=debug,openshell_driver_vm=debug \
   mise run gateway:vm
 ```
 
-The VM guest's serial console is appended to `<state-dir>/<sandbox-id>/console.log`. Sandbox IDs must match `[A-Za-z0-9._-]{1,128}` before the driver uses them in host paths. The gateway-owned compute-driver socket lives at `<state-dir>/run/compute-driver.sock`; OpenShell creates `run/` with owner-only permissions, removes same-owner stale sockets, and the gateway removes the socket on clean shutdown via `ManagedDriverProcess::drop`. UDS clients must match the driver UID and provide the expected gateway process PID by default. Standalone same-UID UDS mode requires the explicit `--allow-same-uid-peer` development flag. TCP mode is disabled by default because it is unauthenticated; use `--allow-unauthenticated-tcp --bind-address 127.0.0.1:50061` only for local development.
+The VM guest's serial console is appended to `<state-dir>/<sandbox-id>/console.log`. Sandbox IDs must match `[A-Za-z0-9._-]{1,128}` before the driver uses them in host paths. The gateway-owned compute-driver socket lives at `<state-dir>/run/compute-driver.sock`; OpenShell creates `run/` with owner-only permissions and removes same-owner stale sockets. On clean shutdown, the gateway sends the managed driver `SIGTERM`, waits up to five seconds for it to flush telemetry and exit, then force-kills it if necessary and removes the socket. UDS clients must match the driver UID and provide the expected gateway process PID by default. Standalone same-UID UDS mode requires the explicit `--allow-same-uid-peer` development flag. TCP mode is disabled by default because it is unauthenticated; use `--allow-unauthenticated-tcp --bind-address 127.0.0.1:50061` only for local development.
 
 ## Host-side nftables rules
 

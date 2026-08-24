@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use openshell_core::config::{CDI_GPU_DEVICE_ALL, DEFAULT_SERVER_PORT};
+use openshell_core::config::DEFAULT_SERVER_PORT;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_NAMESPACE,
+    LABEL_SANDBOX_NAMESPACE, supervisor_cache_path_with_base,
 };
 use openshell_core::progress::{
     PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
@@ -14,10 +14,12 @@ use openshell_core::progress::{
 };
 use openshell_core::proto::compute::v1::{
     DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
+    GetGatewayListenerRequirementsRequest, GpuResourceRequirements, ResourceRequirements,
+    gateway_listener_requirement::Selector,
 };
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use tempfile::TempDir;
 
 const TLS_MOUNT_DIR: &str = "/etc/openshell/tls/client";
@@ -39,14 +41,50 @@ fn test_sandbox() -> DriverSandbox {
                 agent_socket_path: String::new(),
                 labels: HashMap::new(),
                 environment: HashMap::from([("TEMPLATE_ENV".to_string(), "template".to_string())]),
-                resources: None,
-                platform_config: None,
+                ..Default::default()
             }),
-            gpu: false,
-            gpu_device: String::new(),
+            resource_requirements: None,
             sandbox_token: String::new(),
         }),
         status: None,
+        workspace: String::new(),
+    }
+}
+
+fn cdi_devices_config(device_ids: &[&str]) -> prost_types::Struct {
+    list_string_driver_config("cdi_devices", device_ids)
+}
+
+fn cdi_device_typo_config(device_ids: &[&str]) -> prost_types::Struct {
+    list_string_driver_config("cdi_device", device_ids)
+}
+
+fn list_string_driver_config(field: &str, values: &[&str]) -> prost_types::Struct {
+    prost_types::Struct {
+        fields: std::iter::once((
+            field.to_string(),
+            prost_types::Value {
+                kind: Some(prost_types::value::Kind::ListValue(
+                    prost_types::ListValue {
+                        values: values
+                            .iter()
+                            .map(|device_id| prost_types::Value {
+                                kind: Some(prost_types::value::Kind::StringValue(
+                                    (*device_id).to_string(),
+                                )),
+                            })
+                            .collect(),
+                    },
+                )),
+            },
+        ))
+        .collect(),
+    }
+}
+
+fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
+    ResourceRequirements {
+        gpu: Some(GpuResourceRequirements { count }),
     }
 }
 
@@ -64,6 +102,10 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
             ),
             host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
         },
+        gateway_callback_bind_address: Some(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            DEFAULT_SERVER_PORT,
+        )),
         ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
         stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
         log_level: "info".to_string(),
@@ -75,8 +117,109 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         }),
         daemon_version: "28.0.0".to_string(),
         supports_gpu: false,
+        allow_all_default_gpu: false,
         sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
+        enable_bind_mounts: false,
     }
+}
+
+fn json_struct(value: serde_json::Value) -> prost_types::Struct {
+    let serde_json::Value::Object(object) = value else {
+        panic!("expected JSON object");
+    };
+    openshell_core::proto_struct::json_object_to_struct(object)
+        .expect("test JSON must convert to a protobuf Struct")
+}
+
+fn inspected_volume(driver: &str, options: HashMap<String, String>) -> bollard::models::Volume {
+    bollard::models::Volume {
+        name: "openshell-test-volume".to_string(),
+        driver: driver.to_string(),
+        mountpoint: "/var/lib/docker/volumes/openshell-test-volume/_data".to_string(),
+        created_at: None,
+        status: None,
+        labels: HashMap::new(),
+        scope: None,
+        cluster_volume: None,
+        options,
+        usage_data: None,
+    }
+}
+
+fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDriver {
+    let allow_all_default_gpu = config.allow_all_default_gpu;
+    DockerComputeDriver {
+        docker: Arc::new(
+            Docker::connect_with_http("http://127.0.0.1:2375", 1, bollard::API_DEFAULT_VERSION)
+                .expect("construct test Docker client"),
+        ),
+        config,
+        events: broadcast::channel(WATCH_BUFFER).0,
+        pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
+            CdiGpuInventory::default(),
+            allow_all_default_gpu,
+        )),
+        lifecycle_event_fences: DockerLifecycleEventFences::default(),
+    }
+}
+
+#[tokio::test]
+async fn gateway_listener_requirements_report_managed_bridge_address() {
+    let config = runtime_config();
+    let expected_address = match config.gateway_route {
+        DockerGatewayRoute::Bridge { bind_address, .. } => bind_address,
+        DockerGatewayRoute::HostGateway => panic!("test config must use a managed bridge"),
+    };
+    let driver = test_driver_with_config(config);
+
+    let response = driver
+        .get_gateway_listener_requirements(Request::new(GetGatewayListenerRequirementsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.requirements.len(), 1);
+    assert_eq!(
+        response.requirements[0].selector,
+        Some(Selector::ExactBindAddress(expected_address.to_string()))
+    );
+}
+
+#[tokio::test]
+async fn gateway_listener_requirements_are_empty_for_host_gateway_route() {
+    let mut config = runtime_config();
+    config.gateway_route = DockerGatewayRoute::HostGateway;
+    config.gateway_callback_bind_address = None;
+    let driver = test_driver_with_config(config);
+
+    let response = driver
+        .get_gateway_listener_requirements(Request::new(GetGatewayListenerRequirementsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(response.requirements.is_empty());
+}
+
+#[tokio::test]
+async fn host_gateway_route_reports_ipv4_loopback_callback_listener() {
+    let mut config = runtime_config();
+    config.gateway_route = DockerGatewayRoute::HostGateway;
+    config.gateway_callback_bind_address = Some("127.0.0.1:17670".parse().unwrap());
+    let driver = test_driver_with_config(config);
+
+    let response = driver
+        .get_gateway_listener_requirements(Request::new(GetGatewayListenerRequirementsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.requirements.len(), 1);
+    assert_eq!(
+        response.requirements[0].selector,
+        Some(Selector::ExactBindAddress("127.0.0.1:17670".to_string()))
+    );
 }
 
 #[test]
@@ -178,6 +321,31 @@ fn docker_gateway_route_uses_host_gateway_for_docker_desktop() {
             "host.openshell.internal:host-gateway".to_string()
         ]
     );
+}
+
+#[test]
+fn host_gateway_route_requests_ipv4_loopback_for_ipv6_primary() {
+    assert_eq!(
+        docker_gateway_callback_bind_address(
+            &DockerGatewayRoute::HostGateway,
+            "[::1]:17670".parse().unwrap(),
+        ),
+        Some("127.0.0.1:17670".parse().unwrap())
+    );
+}
+
+#[test]
+fn host_gateway_route_reuses_ipv4_primary_when_it_covers_loopback() {
+    for primary in ["127.0.0.1:17670", "0.0.0.0:17670"] {
+        assert_eq!(
+            docker_gateway_callback_bind_address(
+                &DockerGatewayRoute::HostGateway,
+                primary.parse().unwrap(),
+            ),
+            None,
+            "{primary} already covers the IPv4 loopback callback"
+        );
+    }
 }
 
 #[test]
@@ -391,7 +559,7 @@ fn docker_resource_limits_rejects_requests() {
             memory_request: String::new(),
             memory_limit: String::new(),
         }),
-        platform_config: None,
+        ..Default::default()
     };
 
     let err = docker_resource_limits(&template).unwrap_err();
@@ -411,7 +579,7 @@ fn docker_resource_limits_applies_cpu_and_memory_limits() {
             memory_limit: "2Gi".to_string(),
             ..Default::default()
         }),
-        platform_config: None,
+        ..Default::default()
     };
 
     let limits = docker_resource_limits(&template).unwrap();
@@ -430,6 +598,12 @@ fn docker_pids_limit_uses_driver_default_and_allows_runtime_inherit() {
 }
 
 #[test]
+fn docker_compute_config_disables_bind_mounts_by_default() {
+    let cfg = DockerComputeConfig::default();
+    assert!(!cfg.enable_bind_mounts);
+}
+
+#[test]
 fn container_create_body_sets_driver_owned_pids_limit() {
     let body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
     let host_config = body.host_config.expect("host config");
@@ -445,6 +619,247 @@ fn build_environment_sets_docker_tls_paths() {
     assert!(env.contains(&"TEMPLATE_ENV=template".to_string()));
     assert!(env.contains(&"SPEC_ENV=spec".to_string()));
     assert!(env.contains(&"OPENSHELL_SANDBOX_COMMAND=sleep infinity".to_string()));
+}
+
+#[test]
+fn build_environment_protects_oci_identity_metadata() {
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    for (key, value) in [
+        (openshell_core::sandbox_env::OCI_IMAGE_USER, "spoofed"),
+        (openshell_core::sandbox_env::SANDBOX_UID, "9999"),
+        (openshell_core::sandbox_env::SANDBOX_GID, "9999"),
+    ] {
+        spec.environment.insert(key.to_string(), value.to_string());
+    }
+
+    let env = build_environment_for_oci_user(&sandbox, &runtime_config(), "app:staff");
+
+    assert!(env.contains(&format!(
+        "{}=app:staff",
+        openshell_core::sandbox_env::OCI_IMAGE_USER
+    )));
+    assert!(env.contains(&format!("{}=", openshell_core::sandbox_env::SANDBOX_UID)));
+    assert!(env.contains(&format!("{}=", openshell_core::sandbox_env::SANDBOX_GID)));
+    assert!(!env.iter().any(|entry| entry.ends_with("=spoofed")));
+    assert!(!env.iter().any(|entry| entry.ends_with("=9999")));
+}
+
+#[test]
+fn build_environment_strips_gateway_tls_server_name() {
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.environment.insert(
+        openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME.to_string(),
+        "evil.attacker.example.com".to_string(),
+    );
+
+    let env = build_environment(&sandbox, &runtime_config());
+
+    assert!(
+        !env.iter().any(|entry| entry.starts_with(&format!(
+            "{}=",
+            openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME
+        ))),
+        "GATEWAY_TLS_SERVER_NAME must be stripped from the supervisor environment"
+    );
+}
+
+#[test]
+fn container_creation_uses_inspected_immutable_image() {
+    let sandbox = test_sandbox();
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "/workspace/project".to_string(),
+        volumes: Vec::new(),
+    };
+    let body = build_container_create_body_for_image(
+        &sandbox,
+        &runtime_config(),
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &metadata,
+    )
+    .unwrap();
+
+    assert_eq!(body.image.as_deref(), Some("sha256:immutable"));
+    assert_eq!(body.user.as_deref(), Some("0"));
+    assert_eq!(body.working_dir.as_deref(), Some("/"));
+    assert_eq!(
+        body.cmd.as_deref(),
+        Some(&["--workdir".to_string(), "/workspace/project".to_string()][..])
+    );
+    assert!(body.env.unwrap().contains(&format!(
+        "{}=1234:1235",
+        openshell_core::sandbox_env::OCI_IMAGE_USER
+    )));
+}
+
+#[test]
+fn container_creation_rejects_invalid_oci_working_dir() {
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "relative/workspace".to_string(),
+        volumes: Vec::new(),
+    };
+    let err = build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &metadata,
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("must be an absolute container path"));
+}
+
+#[test]
+fn container_creation_rejects_openshell_control_path_working_dir() {
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "/opt/openshell/bin/project".to_string(),
+        volumes: Vec::new(),
+    };
+    let err = build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &metadata,
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("OpenShell control path"));
+}
+
+#[test]
+fn container_creation_rejects_image_volume_that_masks_working_dir() {
+    let sandbox = test_sandbox();
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "/workspace/project".to_string(),
+        volumes: vec!["/workspace".to_string()],
+    };
+
+    let error = build_container_create_body_for_image(
+        &sandbox,
+        &runtime_config(),
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &metadata,
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .message()
+            .contains("masks OCI WorkingDir '/workspace/project'")
+    );
+}
+
+#[test]
+fn container_creation_rejects_image_volume_over_configured_ssh_socket() {
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "/workspace".to_string(),
+        volumes: vec!["/custom-runtime".to_string()],
+    };
+    let mut config = runtime_config();
+    config.ssh_socket_path = "/custom-runtime/ssh.sock".to_string();
+
+    let error = build_container_create_body_for_image(
+        &test_sandbox(),
+        &config,
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &metadata,
+    )
+    .unwrap_err();
+
+    assert!(error.message().contains("OpenShell control path"));
+}
+
+#[test]
+fn container_creation_reserves_resolved_workspace_root_but_allows_nested_mounts() {
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "/workspace".to_string(),
+        volumes: Vec::new(),
+    };
+    let root_mount: DockerSandboxDriverConfig = serde_json::from_value(serde_json::json!({
+        "mounts": [{"type": "tmpfs", "target": "/workspace"}]
+    }))
+    .unwrap();
+    let err = build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &root_mount,
+        None,
+        &metadata,
+    )
+    .unwrap_err();
+    assert!(
+        err.message()
+            .contains("reserved for the OpenShell workspace")
+    );
+
+    let ancestor_mount: DockerSandboxDriverConfig = serde_json::from_value(serde_json::json!({
+        "mounts": [{"type": "tmpfs", "target": "/workspace"}]
+    }))
+    .unwrap();
+    let nested_metadata = DockerImageMetadata {
+        working_dir: "/workspace/project".to_string(),
+        volumes: Vec::new(),
+        ..metadata.clone()
+    };
+    let err = build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &ancestor_mount,
+        None,
+        &nested_metadata,
+    )
+    .unwrap_err();
+    assert!(
+        err.message()
+            .contains("reserved for the OpenShell workspace")
+    );
+
+    let nested_mount: DockerSandboxDriverConfig = serde_json::from_value(serde_json::json!({
+        "mounts": [{"type": "tmpfs", "target": "/workspace/cache"}]
+    }))
+    .unwrap();
+    build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &nested_mount,
+        None,
+        &metadata,
+    )
+    .expect("nested workspace mounts remain supported");
+
+    let compatibility_path_mount: DockerSandboxDriverConfig =
+        serde_json::from_value(serde_json::json!({
+            "mounts": [{"type": "tmpfs", "target": "/sandbox"}]
+        }))
+        .unwrap();
+    build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &compatibility_path_mount,
+        None,
+        &metadata,
+    )
+    .expect("/sandbox remains mountable when the inspected workspace is elsewhere");
 }
 
 #[test]
@@ -524,6 +939,557 @@ fn build_binds_uses_docker_tls_directory() {
 }
 
 #[test]
+fn build_container_create_body_includes_driver_config_mounts() {
+    let mut sandbox = test_sandbox();
+    let template = sandbox.spec.as_mut().unwrap().template.as_mut().unwrap();
+    template.driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [
+            {
+                "type": "volume",
+                "source": "work-nfs",
+                "target": "/sandbox/work",
+                "read_only": true,
+                "subpath": "project-a"
+            },
+            {
+                "type": "tmpfs",
+                "target": "/sandbox/cache",
+                "options": ["nosuid", "size=1048576"],
+                "size_bytes": 1_048_576,
+                "mode": 511
+            }
+        ]
+    })));
+
+    let body = build_container_create_body(&sandbox, &runtime_config()).unwrap();
+    let mounts = body
+        .host_config
+        .unwrap()
+        .mounts
+        .expect("driver config mounts should be set");
+
+    assert_eq!(mounts.len(), 2);
+    assert_eq!(mounts[0].typ, Some(MountTypeEnum::VOLUME));
+    assert_eq!(mounts[0].source.as_deref(), Some("work-nfs"));
+    assert_eq!(mounts[0].target.as_deref(), Some("/sandbox/work"));
+    assert_eq!(mounts[0].read_only, Some(true));
+    assert_eq!(
+        mounts[0]
+            .volume_options
+            .as_ref()
+            .and_then(|options| options.subpath.as_deref()),
+        Some("project-a")
+    );
+    assert_eq!(mounts[1].typ, Some(MountTypeEnum::TMPFS));
+    assert_eq!(mounts[1].target.as_deref(), Some("/sandbox/cache"));
+    assert_eq!(
+        mounts[1]
+            .tmpfs_options
+            .as_ref()
+            .and_then(|options| options.size_bytes),
+        Some(1_048_576)
+    );
+}
+
+#[test]
+fn driver_config_defaults_volume_mounts_to_read_only() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "volume",
+            "source": "work-nfs",
+            "target": "/sandbox/work"
+        }]
+    })));
+
+    let body = build_container_create_body(&sandbox, &runtime_config()).unwrap();
+    let mounts = body
+        .host_config
+        .unwrap()
+        .mounts
+        .expect("driver config mounts should be set");
+
+    assert_eq!(mounts[0].read_only, Some(true));
+}
+
+#[test]
+fn driver_config_allows_explicit_writable_volume_mounts() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "volume",
+            "source": "work-nfs",
+            "target": "/sandbox/work",
+            "read_only": false
+        }]
+    })));
+
+    let body = build_container_create_body(&sandbox, &runtime_config()).unwrap();
+    let mounts = body
+        .host_config
+        .unwrap()
+        .mounts
+        .expect("driver config mounts should be set");
+
+    assert_eq!(mounts[0].read_only, Some(false));
+}
+
+#[test]
+fn driver_config_rejects_duplicate_mount_targets() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [
+            {
+                "type": "volume",
+                "source": "work-nfs",
+                "target": "/sandbox/work"
+            },
+            {
+                "type": "tmpfs",
+                "target": "/sandbox/work"
+            }
+        ]
+    })));
+
+    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message()
+            .contains("duplicate docker driver_config mount target")
+    );
+}
+
+#[test]
+fn driver_config_rejects_bind_mounts_unless_enabled() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": "/host/path",
+            "target": "/sandbox/host"
+        }]
+    })));
+
+    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("enable_bind_mounts = true"));
+}
+
+#[test]
+fn build_container_create_body_includes_bind_mounts_when_enabled() {
+    let bind_src = TempDir::new().unwrap();
+    let src_path = bind_src.path().to_str().unwrap();
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": src_path,
+            "target": "/sandbox/host",
+            "read_only": true
+        }]
+    })));
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+
+    let body = build_container_create_body(&sandbox, &config).unwrap();
+    let binds = body
+        .host_config
+        .as_ref()
+        .unwrap()
+        .binds
+        .as_ref()
+        .expect("binds should be set");
+
+    // User bind mount appears after the system binds.
+    let expected = format!("{src_path}:/sandbox/host:ro");
+    assert!(
+        binds.iter().any(|b| b == &expected),
+        "expected bind entry '{expected}', got {binds:?}"
+    );
+    // Bind mounts must not appear in the structured mounts vec.
+    let mounts = body.host_config.unwrap().mounts.unwrap_or_default();
+    assert!(
+        mounts.iter().all(|m| m.typ != Some(MountTypeEnum::BIND)),
+        "bind mounts should not appear in structured mounts"
+    );
+}
+
+#[test]
+fn driver_config_defaults_enabled_bind_mounts_to_read_only() {
+    let bind_src = TempDir::new().unwrap();
+    let src_path = bind_src.path().to_str().unwrap();
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": src_path,
+            "target": "/sandbox/host"
+        }]
+    })));
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+
+    let body = build_container_create_body(&sandbox, &config).unwrap();
+    let binds = body
+        .host_config
+        .unwrap()
+        .binds
+        .expect("binds should be set");
+
+    let expected = format!("{src_path}:/sandbox/host:ro");
+    assert!(
+        binds.iter().any(|b| b == &expected),
+        "default bind mount should be read-only, got {binds:?}"
+    );
+}
+
+#[test]
+fn bind_mount_selinux_shared_label() {
+    let bind_src = TempDir::new().unwrap();
+    let src_path = bind_src.path().to_str().unwrap();
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": src_path,
+            "target": "/sandbox/data",
+            "read_only": true,
+            "selinux_label": "shared"
+        }]
+    })));
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+
+    let body = build_container_create_body(&sandbox, &config).unwrap();
+    let binds = body
+        .host_config
+        .unwrap()
+        .binds
+        .expect("binds should be set");
+
+    let expected = format!("{src_path}:/sandbox/data:ro,z");
+    assert!(
+        binds.iter().any(|b| b == &expected),
+        "expected ':ro,z' label, got {binds:?}"
+    );
+}
+
+#[test]
+fn bind_mount_selinux_private_label() {
+    let bind_src = TempDir::new().unwrap();
+    let src_path = bind_src.path().to_str().unwrap();
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": src_path,
+            "target": "/sandbox/data",
+            "read_only": false,
+            "selinux_label": "private"
+        }]
+    })));
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+
+    let body = build_container_create_body(&sandbox, &config).unwrap();
+    let binds = body
+        .host_config
+        .unwrap()
+        .binds
+        .expect("binds should be set");
+
+    let expected = format!("{src_path}:/sandbox/data:Z");
+    assert!(
+        binds.iter().any(|b| b == &expected),
+        "expected ':Z' label, got {binds:?}"
+    );
+}
+
+#[test]
+fn bind_mount_without_selinux_label() {
+    let bind_src = TempDir::new().unwrap();
+    let src_path = bind_src.path().to_str().unwrap();
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": src_path,
+            "target": "/sandbox/host",
+            "read_only": false
+        }]
+    })));
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+
+    let body = build_container_create_body(&sandbox, &config).unwrap();
+    let binds = body
+        .host_config
+        .unwrap()
+        .binds
+        .expect("binds should be set");
+
+    let expected = format!("{src_path}:/sandbox/host");
+    assert!(
+        binds.iter().any(|b| b == &expected),
+        "expected no options suffix, got {binds:?}"
+    );
+}
+
+#[test]
+fn driver_config_rejects_missing_bind_source() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": "/no/such/path",
+            "target": "/sandbox/data"
+        }]
+    })));
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+
+    let err = build_container_create_body(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message().contains("bind source path does not exist"),
+        "expected missing-source error, got: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn driver_config_rejects_relative_bind_sources_when_enabled() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": "relative/path",
+            "target": "/sandbox/host"
+        }]
+    })));
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+
+    let err = build_container_create_body(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message()
+            .contains("bind source must be an absolute host path")
+    );
+}
+
+#[test]
+fn driver_config_rejects_image_mounts() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "image",
+            "source": "ghcr.io/acme/tools:latest",
+            "target": "/opt/tools"
+        }]
+    })));
+
+    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("invalid docker driver_config"));
+}
+
+#[test]
+fn driver_config_rejects_reserved_mount_targets() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "volume",
+            "source": "work-nfs",
+            "target": "/etc/openshell/auth"
+        }]
+    })));
+
+    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("reserved OpenShell path"));
+}
+
+#[test]
+fn driver_config_rejects_mount_over_configured_ssh_socket() {
+    let mount_config: DockerSandboxDriverConfig = serde_json::from_value(serde_json::json!({
+        "mounts": [{
+            "type": "tmpfs",
+            "target": "/custom-runtime"
+        }]
+    }))
+    .unwrap();
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "/workspace".to_string(),
+        volumes: Vec::new(),
+    };
+    let mut config = runtime_config();
+    config.ssh_socket_path = "/custom-runtime/ssh.sock".to_string();
+
+    let error = build_container_create_body_for_image(
+        &test_sandbox(),
+        &config,
+        &mount_config,
+        None,
+        &metadata,
+    )
+    .unwrap_err();
+
+    assert!(error.message().contains("OpenShell control path"));
+}
+
+#[test]
+fn docker_local_volume_with_bind_option_is_bind_backed() {
+    let volume = inspected_volume(
+        "local",
+        HashMap::from([
+            ("type".to_string(), "none".to_string()),
+            ("o".to_string(), "rw,bind".to_string()),
+            ("device".to_string(), "/tmp/openshell".to_string()),
+        ]),
+    );
+
+    assert!(docker_volume_is_bind_backed(&volume));
+}
+
+#[test]
+fn docker_local_volume_with_rbind_option_is_bind_backed() {
+    let volume = inspected_volume(
+        "local",
+        HashMap::from([
+            ("type".to_string(), "none".to_string()),
+            ("o".to_string(), "rw,rbind".to_string()),
+            ("device".to_string(), "/tmp/openshell".to_string()),
+        ]),
+    );
+
+    assert!(docker_volume_is_bind_backed(&volume));
+}
+
+#[test]
+fn docker_local_volume_without_bind_option_is_not_bind_backed() {
+    let volume = inspected_volume(
+        "local",
+        HashMap::from([
+            ("type".to_string(), "nfs".to_string()),
+            ("o".to_string(), "addr=127.0.0.1,rw".to_string()),
+            ("device".to_string(), ":/exports/openshell".to_string()),
+        ]),
+    );
+
+    assert!(!docker_volume_is_bind_backed(&volume));
+}
+
+#[test]
+fn docker_nonlocal_volume_with_bind_option_is_not_bind_backed() {
+    let volume = inspected_volume(
+        "custom",
+        HashMap::from([("o".to_string(), "bind".to_string())]),
+    );
+
+    assert!(!docker_volume_is_bind_backed(&volume));
+}
+
+#[test]
 fn build_environment_uses_token_file_without_raw_token_env() {
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
@@ -556,14 +1522,17 @@ fn managed_container_label_filters_include_gateway_namespace() {
 }
 
 #[test]
-fn build_container_create_body_clears_inherited_cmd() {
+fn build_container_create_body_replaces_inherited_cmd_with_workspace_arg() {
     let create_body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
 
     assert_eq!(
         create_body.entrypoint,
         Some(vec![SUPERVISOR_MOUNT_PATH.to_string()])
     );
-    assert_eq!(create_body.cmd, Some(Vec::new()));
+    assert_eq!(
+        create_body.cmd,
+        Some(vec!["--workdir".to_string(), "/sandbox".to_string()])
+    );
     assert_eq!(
         create_body
             .labels
@@ -605,12 +1574,171 @@ fn build_container_create_body_clears_inherited_cmd() {
 fn validate_sandbox_rejects_gpu_when_cdi_unavailable() {
     let config = runtime_config();
     let mut sandbox = test_sandbox();
-    sandbox.spec.as_mut().unwrap().gpu = true;
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
 
     let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("Docker CDI"));
+}
+
+#[test]
+fn validate_sandbox_rejects_missing_gpu_support_before_request_shape() {
+    let config = runtime_config();
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resources(Some(2)));
+    spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&["nvidia.com/gpu=0"]));
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("Docker CDI"));
+}
+
+#[test]
+fn validate_sandbox_rejects_invalid_cdi_devices_before_gpu_capability() {
+    let config = runtime_config();
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resources(None));
+    spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&[]));
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("invalid docker driver_config"));
+    assert!(err.message().contains("non-empty list"));
+}
+
+#[test]
+fn validate_sandbox_rejects_unknown_driver_config_fields() {
+    let config = runtime_config();
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resources(None));
+    spec.template.as_mut().unwrap().driver_config =
+        Some(cdi_device_typo_config(&["nvidia.com/gpu=0"]));
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("unknown field"));
+}
+
+#[test]
+fn validate_sandbox_accepts_gpu_count_request_shape() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(Some(2)));
+
+    DockerComputeDriver::validate_sandbox(&sandbox, &config)
+        .expect("default GPU count shape should be accepted before inventory selection");
+}
+
+#[test]
+fn validate_sandbox_accepts_gpu_count_matching_cdi_devices() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resources(Some(2)));
+    spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&[
+        "nvidia.com/gpu=0",
+        "nvidia.com/gpu=1",
+    ]));
+
+    DockerComputeDriver::validate_sandbox(&sandbox, &config)
+        .expect("matching explicit CDI device count should be accepted");
+}
+
+#[test]
+fn validate_sandbox_accepts_single_cdi_device_without_gpu_count() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resources(None));
+    spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&["nvidia.com/gpu=0"]));
+
+    DockerComputeDriver::validate_sandbox(&sandbox, &config)
+        .expect("single exact CDI device should be compatible with a default GPU request");
+}
+
+#[test]
+fn validate_sandbox_rejects_multiple_cdi_devices_without_gpu_count() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resources(None));
+    spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&[
+        "nvidia.com/gpu=0",
+        "nvidia.com/gpu=1",
+    ]));
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message()
+            .contains("gpu count (1) must match driver_config.cdi_devices length (2)")
+    );
+}
+
+#[test]
+fn validate_sandbox_rejects_cdi_devices_without_gpu_request() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(cdi_devices_config(&["nvidia.com/gpu=0"]));
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("requires a gpu request"));
+}
+
+#[test]
+fn validate_sandbox_rejects_gpu_count_mismatched_cdi_devices() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resources(Some(2)));
+    spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&["nvidia.com/gpu=0"]));
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message()
+            .contains("gpu count (2) must match driver_config.cdi_devices length (1)")
+    );
+}
+
+#[test]
+fn validate_sandbox_rejects_template_errors_before_device_config() {
+    let config = runtime_config();
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resources(None));
+    let template = spec.template.as_mut().unwrap();
+    template.agent_socket_path = "/tmp/agent.sock".to_string();
+    template.driver_config = Some(cdi_devices_config(&[]));
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("agent_socket_path"));
 }
 
 #[test]
@@ -636,13 +1764,21 @@ fn validate_sandbox_auth_accepts_gateway_token() {
 }
 
 #[test]
-fn build_container_create_body_maps_gpu_to_all_cdi_device() {
+fn build_container_create_body_maps_default_gpu_to_selected_cdi_device() {
     let mut config = runtime_config();
     config.supports_gpu = true;
     let mut sandbox = test_sandbox();
-    sandbox.spec.as_mut().unwrap().gpu = true;
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
 
-    let create_body = build_container_create_body(&sandbox, &config).unwrap();
+    let driver_config = DockerSandboxDriverConfig::default();
+    let gpu_devices = vec!["nvidia.com/gpu=1".to_string()];
+    let create_body = build_container_create_body_with_gpu_devices(
+        &sandbox,
+        &config,
+        &driver_config,
+        Some(&gpu_devices),
+    )
+    .unwrap();
     let request = create_body
         .host_config
         .as_ref()
@@ -653,7 +1789,25 @@ fn build_container_create_body_maps_gpu_to_all_cdi_device() {
     assert_eq!(request.driver.as_deref(), Some("cdi"));
     assert_eq!(
         request.device_ids.as_ref().unwrap(),
-        &vec![CDI_GPU_DEVICE_ALL.to_string()]
+        &vec!["nvidia.com/gpu=1".to_string()]
+    );
+}
+
+#[test]
+fn build_container_create_body_omits_devices_without_resolved_default_cdi_devices() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
+
+    let create_body = build_container_create_body(&sandbox, &config).unwrap();
+
+    assert!(
+        create_body
+            .host_config
+            .as_ref()
+            .and_then(|host_config| host_config.device_requests.as_ref())
+            .is_none()
     );
 }
 
@@ -663,8 +1817,8 @@ fn build_container_create_body_passes_explicit_cdi_device_id_through() {
     config.supports_gpu = true;
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
-    spec.gpu = true;
-    spec.gpu_device = "nvidia.com/gpu=0".to_string();
+    spec.resource_requirements = Some(gpu_resources(None));
+    spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&["nvidia.com/gpu=0"]));
 
     let create_body = build_container_create_body(&sandbox, &config).unwrap();
     let request = create_body
@@ -679,6 +1833,170 @@ fn build_container_create_body_passes_explicit_cdi_device_id_through() {
         request.device_ids.as_ref().unwrap(),
         &vec!["nvidia.com/gpu=0".to_string()]
     );
+}
+
+#[test]
+fn build_container_create_body_rejects_gpu_count_mismatched_cdi_devices() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resources(Some(2)));
+    spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&["nvidia.com/gpu=0"]));
+
+    let err = build_container_create_body(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message()
+            .contains("gpu count (2) must match driver_config.cdi_devices length (1)")
+    );
+}
+
+#[test]
+fn build_container_create_body_rejects_cdi_devices_without_gpu_request() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(cdi_devices_config(&["nvidia.com/gpu=0"]));
+
+    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("requires a gpu request"));
+}
+
+#[test]
+fn build_container_create_body_rejects_empty_cdi_devices() {
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resources(None));
+    spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&[]));
+
+    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("non-empty list"));
+}
+
+#[test]
+fn driver_default_gpu_selection_consumes_distinct_devices_for_creates() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let driver = test_driver_with_config(config);
+    driver.gpu_selector.refresh(
+        CdiGpuInventory::new(["nvidia.com/gpu=0", "nvidia.com/gpu=1"]),
+        false,
+    );
+    let mut first_sandbox = test_sandbox();
+    first_sandbox.id = "sbx-first".to_string();
+    first_sandbox.name = "first".to_string();
+    first_sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
+    let mut second_sandbox = test_sandbox();
+    second_sandbox.id = "sbx-second".to_string();
+    second_sandbox.name = "second".to_string();
+    second_sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
+
+    DockerComputeDriver::validate_sandbox(&first_sandbox, &driver.config).unwrap();
+    assert_eq!(
+        driver.gpu_selector.peek_device_ids(1).unwrap(),
+        vec!["nvidia.com/gpu=0".to_string()]
+    );
+    let first_devices = driver.gpu_selector.next_device_ids(1).unwrap();
+    let driver_config = DockerSandboxDriverConfig::default();
+    let first_create_body = build_container_create_body_with_gpu_devices(
+        &first_sandbox,
+        &driver.config,
+        &driver_config,
+        Some(&first_devices),
+    )
+    .unwrap();
+
+    DockerComputeDriver::validate_sandbox(&second_sandbox, &driver.config).unwrap();
+    assert_eq!(
+        driver.gpu_selector.peek_device_ids(1).unwrap(),
+        vec!["nvidia.com/gpu=1".to_string()]
+    );
+    let second_devices = driver.gpu_selector.next_device_ids(1).unwrap();
+    let second_create_body = build_container_create_body_with_gpu_devices(
+        &second_sandbox,
+        &driver.config,
+        &driver_config,
+        Some(&second_devices),
+    )
+    .unwrap();
+
+    let first_request = first_create_body
+        .host_config
+        .as_ref()
+        .and_then(|host_config| host_config.device_requests.as_ref())
+        .and_then(|requests| requests.first())
+        .expect("first default GPU request should add a Docker device request");
+    let second_request = second_create_body
+        .host_config
+        .as_ref()
+        .and_then(|host_config| host_config.device_requests.as_ref())
+        .and_then(|requests| requests.first())
+        .expect("second default GPU request should add a Docker device request");
+
+    assert_eq!(
+        first_request.device_ids.as_ref().unwrap(),
+        &vec!["nvidia.com/gpu=0".to_string()]
+    );
+    assert_eq!(
+        second_request.device_ids.as_ref().unwrap(),
+        &vec!["nvidia.com/gpu=1".to_string()]
+    );
+}
+
+#[test]
+fn docker_info_reports_wsl2_from_kernel_version() {
+    let info = SystemInfo {
+        kernel_version: Some("5.15.153.1-microsoft-standard-WSL2".to_string()),
+        operating_system: Some("Docker Desktop".to_string()),
+        ..Default::default()
+    };
+
+    assert!(docker_info_reports_wsl2(&info));
+}
+
+#[test]
+fn docker_info_reports_wsl2_from_operating_system() {
+    let info = SystemInfo {
+        operating_system: Some("Ubuntu 24.04.4 LTS on WSL2".to_string()),
+        ..Default::default()
+    };
+
+    assert!(docker_info_reports_wsl2(&info));
+}
+
+#[test]
+fn docker_info_reports_wsl2_ignores_daemon_name_and_labels() {
+    let info = SystemInfo {
+        kernel_version: Some("6.8.0-60-generic".to_string()),
+        operating_system: Some("Ubuntu 24.04.4 LTS".to_string()),
+        name: Some("wsl-docker-daemon".to_string()),
+        labels: Some(vec!["com.example.platform=wsl2".to_string()]),
+        ..Default::default()
+    };
+
+    assert!(!docker_info_reports_wsl2(&info));
+}
+
+#[test]
+fn docker_info_reports_wsl2_rejects_plain_linux() {
+    let info = SystemInfo {
+        kernel_version: Some("6.8.0-60-generic".to_string()),
+        operating_system: Some("Ubuntu 24.04.4 LTS".to_string()),
+        os_type: Some("linux".to_string()),
+        architecture: Some("x86_64".to_string()),
+        ..Default::default()
+    };
+
+    assert!(!docker_info_reports_wsl2(&info));
 }
 
 #[test]
@@ -764,34 +2082,19 @@ fn driver_status_keeps_running_sandboxes_provisioning_with_stable_message() {
         ..running.clone()
     };
 
-    let running_status = driver_status_from_summary(&running, "demo", false);
-    let running_later_status = driver_status_from_summary(&running_later, "demo", false);
-    assert_eq!(running_status.conditions[0].status, "False");
-    assert_eq!(running_status.conditions[0].reason, "DependenciesNotReady");
-    assert_eq!(
-        running_status.conditions[0].message,
-        "Container is running; waiting for supervisor relay"
-    );
+    // A running container always emits Ready=True with BackendReady. The gateway
+    // composes this with supervisor-session presence to decide public SandboxPhase.
+    let running_status = driver_status_from_summary(&running, "demo");
+    let running_later_status = driver_status_from_summary(&running_later, "demo");
+    assert_eq!(running_status.conditions[0].status, "True");
+    assert_eq!(running_status.conditions[0].reason, "BackendReady");
+    assert_eq!(running_status.conditions[0].message, "Container is running");
     assert_eq!(running_status.conditions, running_later_status.conditions);
 
-    let exited_status = driver_status_from_summary(&exited, "demo", false);
+    let exited_status = driver_status_from_summary(&exited, "demo");
     assert_eq!(exited_status.conditions[0].status, "False");
     assert_eq!(exited_status.conditions[0].reason, "ContainerExited");
     assert_eq!(exited_status.conditions[0].message, "Container exited");
-
-    // With a live supervisor session, a RUNNING container flips Ready=True
-    // so ExecSandbox and other "sandbox must be ready" gates can proceed.
-    let running_connected = driver_status_from_summary(&running, "demo", true);
-    assert_eq!(running_connected.conditions[0].status, "True");
-    assert_eq!(
-        running_connected.conditions[0].reason,
-        "SupervisorConnected"
-    );
-
-    // Supervisor readiness is ignored for non-RUNNING states -- an exited
-    // container must not report Ready=True.
-    let exited_connected = driver_status_from_summary(&exited, "demo", true);
-    assert_eq!(exited_connected.conditions[0].status, "False");
 }
 
 #[test]
@@ -809,7 +2112,7 @@ fn driver_status_marks_restarting_sandboxes_as_error() {
         ..Default::default()
     };
 
-    let status = driver_status_from_summary(&restarting, "demo", false);
+    let status = driver_status_from_summary(&restarting, "demo");
     assert_eq!(status.conditions[0].status, "False");
     assert_eq!(status.conditions[0].reason, "ContainerRestarting");
     assert_eq!(
@@ -942,7 +2245,7 @@ fn validate_linux_elf_binary_rejects_non_elf_files() {
     fs::write(&path, b"not-elf").unwrap();
 
     let err = validate_linux_elf_binary(&path).unwrap_err();
-    assert!(err.to_string().contains("Linux ELF executable"));
+    assert!(err.contains("Linux ELF executable"));
 }
 
 #[test]
@@ -988,6 +2291,7 @@ fn container_name_preserves_id_suffix_for_long_names() {
         namespace: "default".to_string(),
         spec: None,
         status: None,
+        workspace: "default".to_string(),
     };
     let second = DriverSandbox {
         id: "sbx-second-0987654321".to_string(),
@@ -1013,15 +2317,19 @@ fn container_name_preserves_id_suffix_for_long_names() {
 }
 
 #[test]
-fn container_name_empty_sandbox_name_uses_id_only() {
+fn container_name_empty_sandbox_name_uses_workspace_and_id() {
     let sandbox = DriverSandbox {
         id: "sbx-abc".to_string(),
         name: String::new(),
         namespace: "default".to_string(),
         spec: None,
         status: None,
+        workspace: "default".to_string(),
     };
-    assert_eq!(container_name_for_sandbox(&sandbox), "openshell-sbx-abc",);
+    assert_eq!(
+        container_name_for_sandbox(&sandbox),
+        "openshell-default---sbx-abc",
+    );
 }
 
 #[test]
@@ -1059,7 +2367,7 @@ fn docker_guest_tls_paths_allows_plain_http_without_tls_flags() {
 
 #[test]
 fn default_docker_supervisor_image_uses_nvidia_ghcr_repo() {
-    let image = default_docker_supervisor_image();
+    let image = openshell_core::config::default_supervisor_image();
     assert!(
         image.starts_with("ghcr.io/nvidia/openshell/supervisor:"),
         "unexpected default image reference: {image}",
@@ -1067,37 +2375,56 @@ fn default_docker_supervisor_image_uses_nvidia_ghcr_repo() {
 }
 
 #[test]
-fn docker_supervisor_image_tag_prefers_explicit_build_tags() {
+fn configured_supervisor_image_takes_precedence_over_local_binaries() {
+    let tempdir = TempDir::new().unwrap();
+    let bin_dir = tempdir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let current_exe = bin_dir.join("openshell-gateway");
+    let sibling = bin_dir.join("openshell-sandbox");
+    fs::write(&current_exe, b"gateway").unwrap();
+    fs::write(&sibling, b"\x7fELFsibling").unwrap();
+
+    let local_build = tempdir.path().join("target/openshell-sandbox");
+    fs::create_dir_all(local_build.parent().unwrap()).unwrap();
+    fs::write(&local_build, b"\x7fELFlocal").unwrap();
+
+    let source = resolve_supervisor_bin_source(
+        &DockerComputeConfig {
+            supervisor_image: Some("example.com/openshell/supervisor:test".to_string()),
+            ..Default::default()
+        },
+        Some(&current_exe),
+        &[local_build],
+    )
+    .unwrap();
+
     assert_eq!(
-        resolve_default_docker_supervisor_image_tag(Some("1.2.3"), Some("sha"), "0.0.0"),
-        "1.2.3",
-    );
-    assert_eq!(
-        resolve_default_docker_supervisor_image_tag(None, Some("sha"), "0.0.0"),
-        "sha",
-    );
-    assert_eq!(
-        resolve_default_docker_supervisor_image_tag(None, None, "1.2.3"),
-        "1.2.3",
-    );
-    assert_eq!(
-        resolve_default_docker_supervisor_image_tag(Some(""), Some(""), "0.0.0"),
-        "dev",
+        source,
+        SupervisorBinSource::Image("example.com/openshell/supervisor:test".to_string())
     );
 }
 
 #[test]
-fn docker_supervisor_image_tag_sanitizes_build_metadata_for_docker() {
+fn docker_supervisor_image_tag_prefers_explicit_build_tags() {
+    use openshell_core::config::resolve_supervisor_image_tag;
     assert_eq!(
-        resolve_default_docker_supervisor_image_tag(None, None, "0.0.37-dev.156+g1d3b741ee"),
+        resolve_supervisor_image_tag(&["1.2.3", "sha", "0.0.0"]),
+        "1.2.3"
+    );
+    assert_eq!(resolve_supervisor_image_tag(&["", "sha", "0.0.0"]), "sha");
+    assert_eq!(resolve_supervisor_image_tag(&["", "", "1.2.3"]), "1.2.3");
+    assert_eq!(resolve_supervisor_image_tag(&["", "", "0.0.0"]), "dev");
+}
+
+#[test]
+fn docker_supervisor_image_tag_sanitizes_build_metadata_for_docker() {
+    use openshell_core::config::resolve_supervisor_image_tag;
+    assert_eq!(
+        resolve_supervisor_image_tag(&["", "", "0.0.37-dev.156+g1d3b741ee"]),
         "0.0.37-dev.156-g1d3b741ee",
     );
     assert_eq!(
-        resolve_default_docker_supervisor_image_tag(
-            Some("0.0.37-dev.156+g1d3b741ee"),
-            None,
-            "0.0.0",
-        ),
+        resolve_supervisor_image_tag(&["0.0.37-dev.156+g1d3b741ee", "", "0.0.0"]),
         "0.0.37-dev.156-g1d3b741ee",
     );
 }
@@ -1124,8 +2451,11 @@ fn docker_supervisor_image_refreshes_mutable_tags_only() {
 #[test]
 fn supervisor_cache_path_namespaces_by_digest_under_openshell_data_dir() {
     let base = PathBuf::from("/var/cache/share");
-    let path =
-        supervisor_cache_path_with_base(&base, "sha256:abc123deadbeef0123456789cafe0123456789fe");
+    let path = supervisor_cache_path_with_base(
+        &base,
+        "docker-supervisor",
+        "sha256:abc123deadbeef0123456789cafe0123456789fe",
+    );
 
     assert_eq!(
         path,
@@ -1138,8 +2468,8 @@ fn supervisor_cache_path_namespaces_by_digest_under_openshell_data_dir() {
 #[test]
 fn supervisor_cache_path_isolates_different_digests() {
     let base = PathBuf::from("/data");
-    let left = supervisor_cache_path_with_base(&base, "sha256:aaaaaaaa");
-    let right = supervisor_cache_path_with_base(&base, "sha256:bbbbbbbb");
+    let left = supervisor_cache_path_with_base(&base, "docker-supervisor", "sha256:aaaaaaaa");
+    let right = supervisor_cache_path_with_base(&base, "docker-supervisor", "sha256:bbbbbbbb");
     assert_ne!(
         left.parent().unwrap(),
         right.parent().unwrap(),
@@ -1213,14 +2543,14 @@ fn extract_first_tar_entry_rejects_empty_archive() {
 }
 
 #[test]
-fn container_state_needs_resume_matches_startable_states() {
+fn container_state_needs_start_matches_startable_states() {
     for state in [
         ContainerSummaryStateEnum::EXITED,
         ContainerSummaryStateEnum::CREATED,
     ] {
         assert!(
-            container_state_needs_resume(state),
-            "{state:?} should be resumed with Docker start",
+            container_state_needs_start(state),
+            "{state:?} should be started with Docker start",
         );
     }
 
@@ -1233,8 +2563,54 @@ fn container_state_needs_resume_matches_startable_states() {
         ContainerSummaryStateEnum::EMPTY,
     ] {
         assert!(
-            !container_state_needs_resume(state),
-            "{state:?} should not be resumed with Docker start",
+            !container_state_needs_start(state),
+            "{state:?} should not be started with Docker start",
         );
     }
+}
+
+#[test]
+fn lifecycle_fence_rejects_polled_exit_from_before_restart() {
+    let fences = DockerLifecycleEventFences::default();
+    fences.begin_start("sandbox-1");
+    assert!(fences.start_in_progress("sandbox-1"));
+    fences.finish_start("sandbox-1");
+    assert!(!fences.start_in_progress("sandbox-1"));
+
+    fences.record_previous_exit("sandbox-1", Some("2026-08-12T16:39:13Z"));
+    assert_eq!(
+        fences.previous_exit("sandbox-1").as_deref(),
+        Some("2026-08-12T16:39:13Z")
+    );
+
+    let previous_exit = ContainerState {
+        status: Some(ContainerStateStatusEnum::EXITED),
+        finished_at: Some("2026-08-12T16:39:13Z".to_string()),
+        ..Default::default()
+    };
+    assert!(docker_polled_exit_is_stale(
+        "2026-08-12T16:39:13Z",
+        Some(&previous_exit),
+    ));
+
+    let running = ContainerState {
+        status: Some(ContainerStateStatusEnum::RUNNING),
+        ..previous_exit.clone()
+    };
+    assert!(docker_polled_exit_is_stale(
+        "2026-08-12T16:39:13Z",
+        Some(&running),
+    ));
+
+    let new_exit = ContainerState {
+        finished_at: Some("2026-08-12T16:40:00Z".to_string()),
+        ..previous_exit
+    };
+    assert!(!docker_polled_exit_is_stale(
+        "2026-08-12T16:39:13Z",
+        Some(&new_exit),
+    ));
+
+    fences.remove("sandbox-1");
+    assert!(fences.previous_exit("sandbox-1").is_none());
 }

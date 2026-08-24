@@ -78,12 +78,29 @@ so a released chart automatically pulls the matching image without extra overrid
 {{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) }}
 {{- end }}
 
+{{/* Official supervisor repository used by the gateway's built-in default. */}}
+{{- define "openshell.defaultSupervisorRepository" -}}
+ghcr.io/nvidia/openshell/supervisor
+{{- end }}
+
 {{/*
-Supervisor image reference. Same appVersion fallback as openshell.image so
-the supervisor and gateway images stay in sync across releases.
+Whether Helm must propagate a supervisor image override into gateway.toml.
+The chart's documented repository and empty tag are the gateway-owned default.
+*/}}
+{{- define "openshell.supervisorImageOverrideEnabled" -}}
+{{- $defaultRepository := include "openshell.defaultSupervisorRepository" . -}}
+{{- $repository := .Values.supervisor.image.repository | default $defaultRepository -}}
+{{- if or (ne $repository $defaultRepository) .Values.supervisor.image.tag -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Supervisor image override. A tag-only override uses the official repository;
+a repository-only override uses the effective gateway image tag.
 */}}
 {{- define "openshell.supervisorImage" -}}
-{{- printf "%s:%s" .Values.supervisor.image.repository (.Values.supervisor.image.tag | default .Chart.AppVersion) }}
+{{- $repository := .Values.supervisor.image.repository | default (include "openshell.defaultSupervisorRepository" .) -}}
+{{- $tag := .Values.supervisor.image.tag | default .Values.image.tag | default .Chart.AppVersion -}}
+{{- printf "%s:%s" $repository $tag }}
 {{- end }}
 
 {{/*
@@ -103,34 +120,37 @@ Namespace where sandbox pods are created. An explicit
 {{- end }}
 
 {{/*
-Fully qualified name of the PostgreSQL subchart, mirroring the Bitnami
-common.names.fullname template so we stay in sync when users set
-postgres.fullnameOverride or postgres.nameOverride.
+Namespace where Kubernetes Secret-backed provider credentials live.
 */}}
-{{- define "openshell.postgresFullname" -}}
-{{- if .Values.postgres.fullnameOverride -}}
-{{- .Values.postgres.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- define "openshell.credentialKubernetesSecretsNamespace" -}}
+{{- .Values.server.credentialDrivers.kubernetesSecrets.namespace | default .Release.Namespace -}}
+{{- end }}
+
+{{/*
+Name of the Secret holding the default credential storage key-encryption key.
+When server.credentialStorage.existingSecret is set, returns that name instead
+of the chart-generated name (for GitOps / helm-template workflows).
+*/}}
+{{- define "openshell.credentialStorageKeyEncryptionKeySecretName" -}}
+{{- if .Values.server.credentialStorage.existingSecret -}}
+{{- .Values.server.credentialStorage.existingSecret -}}
 {{- else -}}
-{{- $name := default "postgres" .Values.postgres.nameOverride -}}
-{{- if contains $name .Release.Name -}}
-{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
-{{- else -}}
-{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
-{{- end -}}
+{{- printf "%s-credential-storage-key-encryption-key" (include "openshell.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 {{- end }}
 
 {{/*
-Name of the Secret holding the PostgreSQL connection URI.
-- server.externalDbSecret set: use it verbatim (always wins)
-- postgres.enabled=true: derive from Bitnami service-binding naming convention
+Key inside the default credential storage key-encryption key Secret.
 */}}
-{{- define "openshell.dbSecretName" -}}
-{{- if .Values.server.externalDbSecret -}}
-{{- .Values.server.externalDbSecret -}}
-{{- else -}}
-{{- printf "%s-svcbind-custom-user" (include "openshell.postgresFullname" .) -}}
-{{- end -}}
+{{- define "openshell.credentialStorageKeyEncryptionKeySecretKey" -}}
+key-encryption-key
+{{- end }}
+
+{{/*
+Gateway environment variable used to pass the default credential storage key-encryption key.
+*/}}
+{{- define "openshell.credentialStorageKeyEncryptionKeyEnvName" -}}
+OPENSHELL_GATEWAY_CREDENTIAL_KEY_ENCRYPTION_KEY
 {{- end }}
 
 {{/*
@@ -172,5 +192,73 @@ init-container
 {{- else -}}
 {{- $scheme := ternary "http" "https" (default false .Values.server.disableTls) -}}
 {{- printf "%s://%s.%s.svc.cluster.local:%d" $scheme (include "openshell.fullname" .) .Release.Namespace (int .Values.service.port) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Default server certificate DNS SANs derived from the release name and namespace.
+Returns a YAML list. Append extra SANs from values with range loops.
+*/}}
+{{- define "openshell.defaultServerDnsNames" -}}
+{{- $name := include "openshell.fullname" . -}}
+{{- $ns := .Release.Namespace -}}
+{{- list $name
+      (printf "%s.%s.svc" $name $ns)
+      (printf "%s.%s.svc.cluster.local" $name $ns)
+      "localhost"
+      (printf "%s.localhost" $name)
+      (printf "*.%s.localhost" $name)
+      "host.docker.internal"
+      "host.containers.internal"
+  | toYaml }}
+{{- end }}
+
+{{/*
+Gateway workload kind. StatefulSet is the default because the default SQLite
+database requires persistent per-pod storage.
+*/}}
+{{- define "openshell.workloadKind" -}}
+{{- $workload := .Values.workload | default dict -}}
+{{- if not (kindIs "map" $workload) -}}
+{{- fail "workload must be a map with kind and allowMultiReplicaStatefulSet fields." -}}
+{{- end -}}
+{{- default "statefulset" (get $workload "kind") | lower -}}
+{{- end }}
+
+{{/*
+Validate chart values that Helm would otherwise accept silently.
+*/}}
+{{- define "openshell.validateValues" -}}
+{{- $workloadKind := include "openshell.workloadKind" . -}}
+{{- $workload := .Values.workload | default dict -}}
+{{- $replicaCount := int (default 1 .Values.replicaCount) -}}
+{{- if and (hasKey .Values "postgres") (kindIs "map" .Values.postgres) (hasKey .Values.postgres "enabled") -}}
+{{- fail "postgres.enabled was removed; the OpenShell chart no longer deploys PostgreSQL. Provision PostgreSQL separately and set server.externalDbSecret to a Secret containing a PostgreSQL URI." -}}
+{{- end -}}
+{{- if not (or (eq $workloadKind "statefulset") (eq $workloadKind "deployment")) -}}
+{{- fail "workload.kind must be one of: statefulset, deployment." -}}
+{{- end -}}
+{{- if and (eq $workloadKind "deployment") (not .Values.server.externalDbSecret) -}}
+{{- fail "workload.kind=deployment requires server.externalDbSecret; use workload.kind=statefulset for the default SQLite database." -}}
+{{- end -}}
+{{- if and (gt $replicaCount 1) (not .Values.server.externalDbSecret) -}}
+{{- fail "replicaCount > 1 requires server.externalDbSecret; multiple gateway replicas cannot share the default per-pod SQLite database." -}}
+{{- end -}}
+{{- if and (eq $workloadKind "statefulset") (gt $replicaCount 1) (not (get $workload "allowMultiReplicaStatefulSet" | default false)) -}}
+{{- fail "replicaCount > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true; use workload.kind=deployment for external database-backed multi-replica gateways." -}}
+{{- end -}}
+{{- $workspaceMode := .Values.server.drivers.kubernetes.workspaceMode | default "shared" -}}
+{{- if not (has $workspaceMode (list "shared" "managed" "operator")) -}}
+{{- fail "server.drivers.kubernetes.workspaceMode must be one of: shared, managed, operator." -}}
+{{- end -}}
+{{- $credentialDrivers := list -}}
+{{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled -}}
+{{- $credentialDrivers = append $credentialDrivers "kubernetes-secrets" -}}
+{{- end -}}
+{{- if .Values.server.credentialDrivers.vault.enabled -}}
+{{- $credentialDrivers = append $credentialDrivers "vault" -}}
+{{- end -}}
+{{- if gt (len $credentialDrivers) 1 -}}
+{{- fail "only one external server.credentialDrivers backend can be enabled at a time." -}}
 {{- end -}}
 {{- end }}

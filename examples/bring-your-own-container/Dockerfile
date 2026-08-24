@@ -14,17 +14,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl iproute2 nftables \
     && rm -rf /var/lib/apt/lists/*
 
-# Create the sandbox user for non-root execution.
-# Use a high UID range to avoid conflicts with host users when running without
-# user namespace remapping (UID in container = UID on host).
-RUN groupadd -g 1000660000 sandbox && \
-    useradd -m -u 1000660000 -g sandbox sandbox
+RUN groupadd --gid 1500 app \
+    && useradd --uid 1500 --gid app --create-home app
 
-RUN install -d -o sandbox -g sandbox /sandbox
+RUN install -d -o app -g app /sandbox
 WORKDIR /sandbox
-COPY --chown=sandbox:sandbox app.py .
+COPY --chown=app:app app.py .
 
 EXPOSE 8080
+
+# Docker and Podman use this non-root identity when policy omits either process
+# identity field. OpenShell starts the supervisor as root and drops only agent
+# children to this account.
+USER app
 
 # NOTE: The sandbox supervisor replaces CMD at runtime.  Pass the start
 # command explicitly:  openshell sandbox create ... -- python /sandbox/app.py

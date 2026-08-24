@@ -5,12 +5,19 @@ from __future__ import annotations
 
 import json
 import os
+import pickle
 import threading
 import time
+from copy import deepcopy
+from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
-from openshell._proto import openshell_pb2
+import pytest
+
+import openshell.sandbox as sandbox_module
+from openshell._proto import datamodel_pb2, openshell_pb2, sandbox_pb2
 from openshell.sandbox import (
     _PYTHON_CLOUDPICKLE_BOOTSTRAP,
     _SANDBOX_PYTHON_BIN,
@@ -18,12 +25,17 @@ from openshell.sandbox import (
     Sandbox,
     SandboxClient,
     SandboxError,
+    SandboxRef,
+    SandboxStatusRef,
     TlsConfig,
+    _atomic_replace,
     _BearerAuthInterceptor,
     _load_cluster_bearer_token,
     _make_cluster_bearer_provider,
     _normalize_bearer,
     _OidcRefresher,
+    _read_oidc_token_bundle,
+    _sandbox_ref,
 )
 
 
@@ -45,10 +57,11 @@ class _FakeStub:
 
 class _FakeInferenceStub:
     def __init__(self) -> None:
-        self.request = None
+        self.set_request = None
+        self.get_request = None
 
-    def SetClusterInference(self, request: Any, timeout: float | None = None) -> Any:
-        self.request = request
+    def SetInferenceRoute(self, request: Any, timeout: float | None = None) -> Any:
+        self.set_request = request
         _ = timeout
 
         class _Response:
@@ -58,8 +71,19 @@ class _FakeInferenceStub:
 
         return _Response()
 
+    def GetInferenceRoute(self, request: Any, timeout: float | None = None) -> Any:
+        self.get_request = request
+        _ = timeout
 
-def _client_with_fake_stub(stub: _FakeStub) -> SandboxClient:
+        class _Response:
+            provider_name = "openai-dev"
+            model_id = "gpt-4.1"
+            version = 2
+
+        return _Response()
+
+
+def _client_with_fake_stub(stub: object) -> SandboxClient:
     client = cast("SandboxClient", object.__new__(SandboxClient))
     client._timeout = 30.0
     client._stub = cast("Any", stub)
@@ -1259,6 +1283,65 @@ def test_refresher_concurrent_write_back_does_not_trample(tmp_path: Path) -> Non
         r.close()
 
 
+class _WindowsPermissionError(PermissionError):
+    winerror: int
+
+
+def test_atomic_replace_retries_windows_sharing_violations(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_text("new")
+    destination.write_text("old")
+    attempts = 0
+    delays: list[float] = []
+    real_replace = Path.replace
+
+    def replace(path: Path, target: Path) -> Path:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            error = _WindowsPermissionError("destination is busy")
+            error.winerror = 32
+            raise error
+        return real_replace(path, target)
+
+    monkeypatch.setattr(sandbox_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(Path, "replace", replace)
+    monkeypatch.setattr(time, "sleep", delays.append)
+
+    _atomic_replace(source, destination)
+
+    assert attempts == 3
+    assert delays == [0.005, 0.01]
+    assert destination.read_text() == "new"
+
+
+def test_atomic_replace_does_not_retry_permanent_windows_errors(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_text("new")
+    attempts = 0
+
+    def replace(_path: Path, _target: Path) -> Path:
+        nonlocal attempts
+        attempts += 1
+        error = _WindowsPermissionError("access denied")
+        error.winerror = 13
+        raise error
+
+    monkeypatch.setattr(sandbox_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(Path, "replace", replace)
+
+    with pytest.raises(PermissionError, match="access denied"):
+        _atomic_replace(source, destination)
+
+    assert attempts == 1
+
+
 def test_sandbox_wrapper_forwards_auth_kwargs_to_from_active_cluster(
     monkeypatch: Any,
 ) -> None:
@@ -1283,6 +1366,7 @@ def test_sandbox_wrapper_forwards_auth_kwargs_to_from_active_cluster(
     )
 
     sandbox = Sandbox(
+        workspace="default",
         cluster="my-gw",
         timeout=42.0,
         auto_refresh=False,
@@ -1324,24 +1408,964 @@ def test_sandbox_wrapper_defaults_match_from_active_cluster(
     import pytest as _pytest
 
     with _pytest.raises(_Sentinel):
-        Sandbox().__enter__()
+        Sandbox(workspace="default").__enter__()
 
     assert captured["auto_refresh"] is True
     assert captured["write_back"] is True
     assert captured["insecure"] is False
 
 
-def test_inference_set_cluster_forwards_no_verify_flag() -> None:
+def test_inference_set_route_forwards_workspace_and_no_verify() -> None:
     stub = _FakeInferenceStub()
     client = cast("InferenceRouteClient", object.__new__(InferenceRouteClient))
     client._timeout = 30.0
     client._stub = cast("Any", stub)
 
-    client.set_cluster(
+    client.set_route(
+        workspace="production",
         provider_name="openai-dev",
         model_id="gpt-4.1",
         no_verify=True,
     )
 
-    assert stub.request is not None
-    assert stub.request.no_verify is True
+    assert stub.set_request is not None
+    assert stub.set_request.no_verify is True
+    assert stub.set_request.workspace == "production"
+
+
+def test_inference_get_route_forwards_workspace() -> None:
+    stub = _FakeInferenceStub()
+    client = cast("InferenceRouteClient", object.__new__(InferenceRouteClient))
+    client._timeout = 30.0
+    client._stub = cast("Any", stub)
+
+    config = client.get_route(workspace="staging")
+
+    assert stub.get_request is not None
+    assert stub.get_request.workspace == "staging"
+    assert config.provider_name == "openai-dev"
+    assert config.model_id == "gpt-4.1"
+    assert config.version == 2
+
+
+# ---------------------------------------------------------------------------
+# Encoding regression tests (utf-8 explicit on all config file reads/writes)
+# ---------------------------------------------------------------------------
+
+
+def test_read_oidc_token_bundle_parses_non_ascii_utf8(tmp_path: Path) -> None:
+    gateway_dir = tmp_path / "gw"
+    gateway_dir.mkdir()
+    payload = {"refresh_token": "tok", "issuer": "https://example.com/é"}
+    (gateway_dir / "oidc_token.json").write_bytes(
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    )
+    result = _read_oidc_token_bundle(gateway_dir)
+    assert result == payload
+
+
+def test_read_oidc_token_bundle_returns_none_on_corrupt_bytes(tmp_path: Path) -> None:
+    gateway_dir = tmp_path / "gw"
+    gateway_dir.mkdir()
+    (gateway_dir / "oidc_token.json").write_bytes(b"\xff\xfe not utf-8")
+    assert _read_oidc_token_bundle(gateway_dir) is None
+
+
+def test_load_cluster_bearer_token_handles_non_ascii_utf8_oidc(tmp_path: Path) -> None:
+    gateway_dir = tmp_path / "gw"
+    gateway_dir.mkdir()
+    bundle = {
+        "access_token": "accéss",
+        "refresh_token": "ref",
+        "expiry": "2099-01-01T00:00:00Z",
+        "issuer": "https://example.com",
+        "client_id": "c",
+        "client_secret": "s",
+    }
+    (gateway_dir / "oidc_token.json").write_bytes(
+        json.dumps(bundle, ensure_ascii=False).encode("utf-8")
+    )
+    token = _load_cluster_bearer_token(gateway_dir)
+    assert token == "accéss"
+
+
+def test_from_active_cluster_reads_utf8_bytes_from_active_gateway_and_metadata(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    gateway_name = "gw-é"
+    gateway_dir = tmp_path / "openshell" / "gateways" / gateway_name
+    gateway_dir.mkdir(parents=True)
+    (tmp_path / "openshell" / "active_gateway").write_bytes(
+        gateway_name.encode("utf-8")
+    )
+    meta = {"gateway_endpoint": "http://tést.example:8080"}
+    (gateway_dir / "metadata.json").write_bytes(
+        json.dumps(meta, ensure_ascii=False).encode("utf-8")
+    )
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("OPENSHELL_GATEWAY", raising=False)
+
+    client = SandboxClient.from_active_cluster()
+    try:
+        assert client._cluster_name == gateway_name
+        assert client._endpoint == "tést.example:8080"
+    finally:
+        client.close()
+
+
+# ---- Sandbox label / selector API tests ----
+
+
+def _make_sandbox_proto(
+    id_: str,
+    name: str,
+    labels: dict[str, str] | None = None,
+    phase: openshell_pb2.SandboxPhase = openshell_pb2.SANDBOX_PHASE_READY,
+    version: int = 0,
+    workspace: str = "default",
+) -> openshell_pb2.Sandbox:
+    sandbox = openshell_pb2.Sandbox()
+    sandbox.metadata.id = id_
+    sandbox.metadata.name = name
+    sandbox.metadata.workspace = workspace
+    for key, value in (labels or {}).items():
+        sandbox.metadata.labels[key] = value
+    sandbox.status.phase = phase
+    sandbox.status.current_policy_version = version
+    return sandbox
+
+
+class _FakeSandboxStub:
+    def __init__(self, listed: list[openshell_pb2.Sandbox] | None = None) -> None:
+        self.create_request: openshell_pb2.CreateSandboxRequest | None = None
+        self.list_request: openshell_pb2.ListSandboxesRequest | None = None
+        self.get_request: openshell_pb2.GetSandboxRequest | None = None
+        self.delete_request: openshell_pb2.DeleteSandboxRequest | None = None
+        self.stop_request: openshell_pb2.StopSandboxRequest | None = None
+        self.start_request: openshell_pb2.StartSandboxRequest | None = None
+        self._listed = listed or []
+
+    def GetSandbox(
+        self,
+        request: openshell_pb2.GetSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.get_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1", request.name, workspace=request.workspace or "default"
+            )
+        )
+
+    def DeleteSandbox(
+        self,
+        request: openshell_pb2.DeleteSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.delete_request = request
+        _ = timeout
+        return SimpleNamespace(deleted=True)
+
+    def StopSandbox(
+        self,
+        request: openshell_pb2.StopSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.stop_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1",
+                request.name,
+                phase=openshell_pb2.SANDBOX_PHASE_STOPPED,
+                workspace=request.workspace,
+            )
+        )
+
+    def StartSandbox(
+        self,
+        request: openshell_pb2.StartSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.start_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1",
+                request.name,
+                phase=openshell_pb2.SANDBOX_PHASE_STARTING,
+                workspace=request.workspace,
+            )
+        )
+
+    def CreateSandbox(
+        self,
+        request: openshell_pb2.CreateSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.create_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1",
+                request.name or "generated",
+                dict(request.labels),
+                workspace=request.workspace or "default",
+            )
+        )
+
+    def ListSandboxes(
+        self,
+        request: openshell_pb2.ListSandboxesRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.list_request = request
+        _ = timeout
+        return SimpleNamespace(sandboxes=list(self._listed))
+
+
+class _RecordingHighLevelClient:
+    """A stand-in for SandboxClient used to observe high-level forwarding."""
+
+    def __init__(self) -> None:
+        self.create_kwargs: dict[str, Any] | None = None
+
+    def create_session(
+        self,
+        *,
+        workspace: str,
+        spec: Any = None,
+        name: str | None = None,
+        labels: Any = None,
+    ) -> Any:
+        self.create_kwargs = {
+            "workspace": workspace,
+            "spec": spec,
+            "name": name,
+            "labels": labels,
+        }
+        return SimpleNamespace(sandbox=SimpleNamespace(name=name or "generated"))
+
+    def wait_ready(
+        self, name: str, *, workspace: str, timeout_seconds: float = 300.0
+    ) -> SandboxRef:
+        _ = timeout_seconds
+        return SandboxRef(
+            id="sandbox-1",
+            name=name,
+            workspace=workspace,
+            status=SandboxStatusRef(phase=2, current_policy_version=0),
+        )
+
+
+def test_create_forwards_name_and_labels() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    ref = client.create(
+        workspace="default", name="job-1", labels={"aiq": "deep-research"}
+    )
+
+    assert stub.create_request is not None
+    assert stub.create_request.name == "job-1"
+    assert dict(stub.create_request.labels) == {"aiq": "deep-research"}
+    assert dict(ref.labels) == {"aiq": "deep-research"}
+
+
+def test_stop_and_start_forward_workspace_and_return_phase() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    stopped = client.stop("job-1", workspace="team-a")
+    assert stub.stop_request is not None
+    assert stub.stop_request.name == "job-1"
+    assert stub.stop_request.workspace == "team-a"
+    assert stopped.phase == openshell_pb2.SANDBOX_PHASE_STOPPED
+
+    starting = client.start("job-1", workspace="team-a")
+    assert stub.start_request is not None
+    assert stub.start_request.name == "job-1"
+    assert stub.start_request.workspace == "team-a"
+    assert starting.phase == openshell_pb2.SANDBOX_PHASE_STARTING
+
+
+def test_create_without_args_sends_empty_metadata() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    client.create(workspace="default")
+
+    assert stub.create_request is not None
+    assert stub.create_request.name == ""
+    assert dict(stub.create_request.labels) == {}
+    assert stub.create_request.workspace == "default"
+
+
+def test_create_copies_caller_labels() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    caller_labels = {"aiq": "deep-research"}
+    client.create(workspace="default", labels=caller_labels)
+    caller_labels["aiq"] = "mutated"
+
+    assert stub.create_request is not None
+    assert dict(stub.create_request.labels) == {"aiq": "deep-research"}
+
+
+def test_create_session_forwards_name_and_labels() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    session = client.create_session(
+        workspace="default", name="job-2", labels={"team": "aiq"}
+    )
+
+    assert stub.create_request is not None
+    assert stub.create_request.name == "job-2"
+    assert dict(stub.create_request.labels) == {"team": "aiq"}
+    assert session.sandbox.name == "job-2"
+
+
+def test_list_forwards_label_selector() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    client.list(workspace="default", label_selector="aiq=deep-research")
+
+    assert stub.list_request is not None
+    assert stub.list_request.label_selector == "aiq=deep-research"
+    assert stub.list_request.workspace == "default"
+
+
+def test_list_without_selector_sends_empty_string() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    client.list(workspace="default")
+
+    assert stub.list_request is not None
+    assert stub.list_request.label_selector == ""
+
+
+def test_list_ids_forwards_label_selector() -> None:
+    stub = _FakeSandboxStub(listed=[_make_sandbox_proto("sandbox-1", "job-1")])
+    client = _client_with_fake_stub(stub)
+
+    ids = client.list_ids(workspace="default", label_selector="aiq=deep-research")
+
+    assert stub.list_request is not None
+    assert stub.list_request.label_selector == "aiq=deep-research"
+    assert ids == ["sandbox-1"]
+
+
+def test_sandbox_ref_retains_gateway_labels() -> None:
+    proto = _make_sandbox_proto(
+        "sandbox-1", "job-1", {"aiq": "deep-research", "env": "dev"}
+    )
+
+    ref = _sandbox_ref(proto)
+
+    assert dict(ref.labels) == {"aiq": "deep-research", "env": "dev"}
+
+
+def test_returned_labels_are_immutable() -> None:
+    proto = _make_sandbox_proto("sandbox-1", "job-1", {"aiq": "deep-research"})
+    ref = _sandbox_ref(proto)
+
+    with pytest.raises(TypeError):
+        ref.labels["mutated"] = "nope"  # type: ignore[index]
+
+
+def test_direct_sandbox_ref_construction_defaults_labels() -> None:
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="job-1",
+        workspace="default",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+    )
+
+    assert dict(ref.labels) == {}
+
+
+def test_sandbox_ref_stays_hashable_with_labels_excluded_from_identity() -> None:
+    ref_a = _sandbox_ref(_make_sandbox_proto("sandbox-1", "job-1", {"aiq": "a"}))
+    ref_b = _sandbox_ref(_make_sandbox_proto("sandbox-1", "job-1", {"aiq": "b"}))
+
+    # Frozen dataclass must remain hashable despite the immutable labels field.
+    assert hash(ref_a) == hash(ref_b)
+    # Labels are excluded from identity: same (id, name, status) compares equal.
+    assert ref_a == ref_b
+    assert {ref_a, ref_b} == {ref_a}
+
+
+def test_sandbox_ref_labels_support_standard_serialization() -> None:
+    ref = _sandbox_ref(
+        _make_sandbox_proto("sandbox-1", "job-1", {"aiq": "deep-research"})
+    )
+
+    assert asdict(ref)["labels"] == {"aiq": "deep-research"}
+    assert dict(deepcopy(ref).labels) == {"aiq": "deep-research"}
+    assert dict(pickle.loads(pickle.dumps(ref)).labels) == {"aiq": "deep-research"}
+
+
+def test_default_sandbox_ref_labels_support_standard_serialization() -> None:
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="job-1",
+        workspace="default",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+    )
+
+    assert asdict(ref)["labels"] == {}
+    assert dict(deepcopy(ref).labels) == {}
+    assert dict(pickle.loads(pickle.dumps(ref)).labels) == {}
+
+
+def test_direct_sandbox_ref_copies_and_freezes_labels() -> None:
+    labels = {"aiq": "deep-research"}
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="job-1",
+        workspace="default",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+        labels=labels,
+    )
+    labels["aiq"] = "mutated"
+
+    assert dict(ref.labels) == {"aiq": "deep-research"}
+    with pytest.raises(TypeError):
+        ref.labels["mutated"] = "nope"  # type: ignore[index]
+
+
+def test_high_level_creation_forwards_name_and_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recording = _RecordingHighLevelClient()
+    monkeypatch.setattr(
+        SandboxClient,
+        "from_active_cluster",
+        classmethod(lambda _cls, **_kwargs: recording),
+    )
+
+    sandbox = Sandbox(
+        workspace="staging",
+        name="job-1",
+        labels={"aiq": "deep-research"},
+        delete_on_exit=False,
+    )
+    sandbox.__enter__()
+
+    assert recording.create_kwargs == {
+        "workspace": "staging",
+        "spec": None,
+        "name": "job-1",
+        "labels": {"aiq": "deep-research"},
+    }
+
+
+def test_high_level_attach_rejects_name() -> None:
+    sandbox = Sandbox(workspace="default", sandbox="existing-sandbox", name="job-1")
+
+    with pytest.raises(SandboxError):
+        sandbox.__enter__()
+
+
+def test_high_level_attach_rejects_labels() -> None:
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="existing",
+        workspace="default",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+    )
+    sandbox = Sandbox(workspace="default", sandbox=ref, labels={"aiq": "deep-research"})
+
+    with pytest.raises(SandboxError):
+        sandbox.__enter__()
+
+
+# ---------------------------------------------------------------------------
+# Workspace support
+# ---------------------------------------------------------------------------
+
+
+def test_create_passes_workspace_to_proto() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    ref = client.create(workspace="staging", name="job-1")
+
+    assert stub.create_request is not None
+    assert stub.create_request.workspace == "staging"
+    assert ref.workspace == "staging"
+
+
+def test_get_passes_workspace_to_proto() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    ref = client.get("job-1", workspace="production")
+
+    assert stub.get_request is not None
+    assert stub.get_request.workspace == "production"
+    assert ref.workspace == "production"
+
+
+def test_delete_passes_workspace_to_proto() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    result = client.delete("job-1", workspace="staging")
+
+    assert result is True
+    assert stub.delete_request is not None
+    assert stub.delete_request.workspace == "staging"
+
+
+def test_list_for_all_workspaces_sets_flag() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    client.list_for_all_workspaces()
+
+    assert stub.list_request is not None
+    assert stub.list_request.all_workspaces is True
+    assert stub.list_request.workspace == ""
+
+
+def test_list_with_workspace_passes_workspace() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    client.list(workspace="staging")
+
+    assert stub.list_request is not None
+    assert stub.list_request.workspace == "staging"
+    assert stub.list_request.all_workspaces is False
+
+
+def test_sandbox_ref_includes_workspace_from_proto() -> None:
+    proto = _make_sandbox_proto("sandbox-1", "job-1", workspace="production")
+
+    ref = _sandbox_ref(proto)
+
+    assert ref.workspace == "production"
+
+
+def test_sandbox_session_delete_passes_workspace() -> None:
+    from openshell.sandbox import SandboxSession
+
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="job-1",
+        workspace="staging",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+    )
+    session = SandboxSession(client, ref)
+
+    session.delete()
+
+    assert stub.delete_request is not None
+    assert stub.delete_request.workspace == "staging"
+
+
+# ---------------------------------------------------------------------------
+# Aible SDK extensions: providers, profiles, refresh, draft policy, config
+# ---------------------------------------------------------------------------
+
+
+class _FakeProviderPolicyStub:
+    """Fake stub for the provider/profile/refresh/draft/config wrappers."""
+
+    def __init__(self) -> None:
+        self.requests: dict[str, Any] = {}
+
+    def _record(self, name: str, request: Any) -> None:
+        self.requests[name] = request
+
+    def _provider_response(self, name: str) -> Any:
+        provider = datamodel_pb2.Provider(
+            metadata=datamodel_pb2.ObjectMeta(id="prov-1", name=name),
+            type="slack",
+            credentials={"SLACK_BOT_TOKEN": "REDACTED"},
+            config={"team": "aible"},
+            credential_expires_at_ms={"SLACK_BOT_TOKEN": 1234},
+            profile_workspace="default",
+        )
+        provider.credential_handles["SLACK_APP_TOKEN"].SetInParent()
+        return SimpleNamespace(provider=provider)
+
+    def GetSandbox(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("GetSandbox", request)
+        _ = timeout
+        sandbox = datamodel_pb2.Sandbox(
+            metadata=datamodel_pb2.ObjectMeta(
+                id="sb-1", name=request.name, created_at_ms=99
+            ),
+            status=openshell_pb2.SandboxStatus(
+                phase=openshell_pb2.SANDBOX_PHASE_READY, current_policy_version=7
+            ),
+        )
+        return SimpleNamespace(sandbox=sandbox)
+
+    def CreateProvider(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("CreateProvider", request)
+        _ = timeout
+        return self._provider_response(request.provider.metadata.name)
+
+    def GetProvider(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("GetProvider", request)
+        _ = timeout
+        return self._provider_response(request.name)
+
+    def ListProviders(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("ListProviders", request)
+        _ = timeout
+        return SimpleNamespace(
+            providers=[self._provider_response("p1").provider]
+        )
+
+    def UpdateProvider(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("UpdateProvider", request)
+        _ = timeout
+        return self._provider_response(request.provider.metadata.name)
+
+    def DeleteProvider(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("DeleteProvider", request)
+        _ = timeout
+        return SimpleNamespace(deleted=True)
+
+    def ListProviderProfiles(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("ListProviderProfiles", request)
+        _ = timeout
+        return SimpleNamespace(profiles=[])
+
+    def GetProviderProfile(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("GetProviderProfile", request)
+        _ = timeout
+        return SimpleNamespace(profile=openshell_pb2.ProviderProfile())
+
+    def ImportProviderProfiles(
+        self, request: Any, timeout: float | None = None
+    ) -> Any:
+        self._record("ImportProviderProfiles", request)
+        _ = timeout
+        return SimpleNamespace(imported=len(request.profiles))
+
+    def LintProviderProfiles(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("LintProviderProfiles", request)
+        _ = timeout
+        return SimpleNamespace(findings=[])
+
+    def UpdateProviderProfiles(
+        self, request: Any, timeout: float | None = None
+    ) -> Any:
+        self._record("UpdateProviderProfiles", request)
+        _ = timeout
+        return SimpleNamespace(profile=request.profile)
+
+    def DeleteProviderProfile(
+        self, request: Any, timeout: float | None = None
+    ) -> Any:
+        self._record("DeleteProviderProfile", request)
+        _ = timeout
+        return SimpleNamespace(deleted=True)
+
+    def ConfigureProviderRefresh(
+        self, request: Any, timeout: float | None = None
+    ) -> Any:
+        self._record("ConfigureProviderRefresh", request)
+        _ = timeout
+        return SimpleNamespace(ok=True)
+
+    def GetProviderRefreshStatus(
+        self, request: Any, timeout: float | None = None
+    ) -> Any:
+        self._record("GetProviderRefreshStatus", request)
+        _ = timeout
+        return SimpleNamespace(credentials=[])
+
+    def RotateProviderCredential(
+        self, request: Any, timeout: float | None = None
+    ) -> Any:
+        self._record("RotateProviderCredential", request)
+        _ = timeout
+        return SimpleNamespace(ok=True)
+
+    def DeleteProviderRefresh(
+        self, request: Any, timeout: float | None = None
+    ) -> Any:
+        self._record("DeleteProviderRefresh", request)
+        _ = timeout
+        return SimpleNamespace(deleted=True)
+
+    def GetDraftPolicy(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("GetDraftPolicy", request)
+        _ = timeout
+        chunk = openshell_pb2.PolicyChunk(
+            id="chunk-1",
+            status="pending",
+            rule_name="allow-slack",
+            binary="/usr/bin/node",
+            rationale="observed",
+            security_notes="",
+            confidence=0.9,
+            hit_count=3,
+            stage="candidate",
+            supersedes_chunk_id="chunk-0",
+            validation_result="ok",
+            rejection_reason="",
+            denial_summary_ids=["d1", "d2"],
+            created_at_ms=10,
+            decided_at_ms=0,
+            first_seen_ms=5,
+            last_seen_ms=9,
+        )
+        return SimpleNamespace(
+            chunks=[chunk],
+            rolling_summary="summary",
+            draft_version=4,
+            last_analyzed_at_ms=42,
+        )
+
+    def ApproveDraftChunk(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("ApproveDraftChunk", request)
+        _ = timeout
+        return SimpleNamespace(policy_version=8, policy_hash="abc")
+
+    def RejectDraftChunk(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("RejectDraftChunk", request)
+        _ = timeout
+        return SimpleNamespace()
+
+    def ApproveAllDraftChunks(
+        self, request: Any, timeout: float | None = None
+    ) -> Any:
+        self._record("ApproveAllDraftChunks", request)
+        _ = timeout
+        return SimpleNamespace(
+            policy_version=9, policy_hash="def", chunks_approved=2, chunks_skipped=1
+        )
+
+    def UpdateConfig(self, request: Any, timeout: float | None = None) -> Any:
+        self._record("UpdateConfig", request)
+        _ = timeout
+        return SimpleNamespace(version=11, policy_hash="xyz", settings_revision=3)
+
+
+def test_get_full_forwards_workspace_and_maps_fields() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    full = client.get_full("job-1", workspace="team-a")
+
+    assert stub.requests["GetSandbox"].workspace == "team-a"
+    assert full.id == "sb-1"
+    assert full.name == "job-1"
+    assert full.namespace == ""
+    assert full.phase == openshell_pb2.SANDBOX_PHASE_READY
+    assert full.created_at_ms == 99
+    assert full.current_policy_version == 7
+
+
+def test_provider_crud_forwards_workspace() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    ref = client.create_provider(
+        workspace="default",
+        name="slack-bot",
+        provider_type="slack",
+        credentials={"SLACK_BOT_TOKEN": "xoxb-secret"},
+    )
+    assert stub.requests["CreateProvider"].workspace == "default"
+    assert ref.id == "prov-1"
+    assert ref.credential_expires_at_ms == {"SLACK_BOT_TOKEN": 1234}
+    assert ref.profile_workspace == "default"
+
+    client.get_provider("slack-bot", workspace="default")
+    assert stub.requests["GetProvider"].workspace == "default"
+
+    listed = client.list_providers(workspace="default", limit=5, offset=1)
+    assert stub.requests["ListProviders"].limit == 5
+    assert stub.requests["ListProviders"].offset == 1
+    assert len(listed) == 1
+
+    client.update_provider(
+        workspace="default",
+        name="slack-bot",
+        provider_type="slack",
+        credential_expires_at_ms={"SLACK_BOT_TOKEN": 777},
+    )
+    assert dict(stub.requests["UpdateProvider"].credential_expires_at_ms) == {
+        "SLACK_BOT_TOKEN": 777
+    }
+
+    assert client.delete_provider("slack-bot", workspace="default") is True
+    assert stub.requests["DeleteProvider"].workspace == "default"
+
+
+def test_provider_ref_unions_credential_and_handle_keys() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    ref = client.get_provider("slack-bot", workspace="default")
+
+    assert ref.credential_keys == ("SLACK_APP_TOKEN", "SLACK_BOT_TOKEN")
+    # values must never surface on the ref
+    assert not hasattr(ref, "credentials")
+
+
+def test_provider_profiles_forward_workspace_and_parse_dicts() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    client.list_provider_profiles(workspace="default")
+    assert stub.requests["ListProviderProfiles"].workspace == "default"
+
+    client.get_provider_profile("prof-1", workspace="default")
+    assert stub.requests["GetProviderProfile"].id == "prof-1"
+
+    client.import_provider_profiles(
+        [{"id": "slack", "display_name": "Slack"}], workspace="default"
+    )
+    imported = stub.requests["ImportProviderProfiles"]
+    assert imported.workspace == "default"
+    assert imported.profiles[0].profile.id == "slack"
+
+    client.lint_provider_profiles([{"id": "slack"}], workspace="default")
+    assert stub.requests["LintProviderProfiles"].workspace == "default"
+
+    client.update_provider_profile(
+        {"id": "slack"},
+        workspace="default",
+        profile_id="prof-1",
+        expected_resource_version=6,
+    )
+    updated = stub.requests["UpdateProviderProfiles"]
+    assert updated.id == "prof-1"
+    assert updated.expected_resource_version == 6
+
+    assert client.delete_provider_profile("prof-1", workspace="default") is True
+
+
+def test_configure_provider_refresh_maps_strategy_via_enum() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    client.configure_provider_refresh(
+        "slack-bot",
+        "SLACK_BOT_TOKEN",
+        "oauth2-refresh-token",
+        workspace="default",
+        material={"client_id": "abc"},
+        expires_at_ms=555,
+    )
+    req = stub.requests["ConfigureProviderRefresh"]
+    assert (
+        req.strategy
+        == openshell_pb2.PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_REFRESH_TOKEN
+    )
+    assert req.expires_at_ms == 555
+    assert req.workspace == "default"
+
+    client.configure_provider_refresh(
+        "aws-prov", "AWS_KEY", "aws_sts_assume_role", workspace="default"
+    )
+    assert (
+        stub.requests["ConfigureProviderRefresh"].strategy
+        == openshell_pb2.PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE
+    )
+
+
+def test_configure_provider_refresh_rejects_unknown_strategy() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    with pytest.raises(SandboxError, match="unknown provider refresh strategy"):
+        client.configure_provider_refresh(
+            "slack-bot", "KEY", "not-a-strategy", workspace="default"
+        )
+
+
+def test_refresh_status_rotate_delete_forward_workspace() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    client.get_provider_refresh_status("slack-bot", workspace="default")
+    assert stub.requests["GetProviderRefreshStatus"].workspace == "default"
+
+    client.rotate_provider_credential("slack-bot", "KEY", workspace="default")
+    assert stub.requests["RotateProviderCredential"].credential_key == "KEY"
+
+    assert (
+        client.delete_provider_refresh("slack-bot", "KEY", workspace="default") is True
+    )
+
+
+def test_get_draft_policy_maps_grown_chunk_fields() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    result = client.get_draft_policy("job-1", workspace="default")
+
+    assert stub.requests["GetDraftPolicy"].workspace == "default"
+    assert result.draft_version == 4
+    chunk = result.chunks[0]
+    assert chunk.stage == "candidate"
+    assert chunk.supersedes_chunk_id == "chunk-0"
+    assert chunk.validation_result == "ok"
+    assert chunk.denial_summary_ids == ("d1", "d2")
+    assert chunk.first_seen_ms == 5
+    assert chunk.endpoints == []  # proposed_rule unset
+
+
+def test_draft_chunk_decisions_forward_workspace() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    approved = client.approve_draft_chunk("job-1", "chunk-1", workspace="default")
+    assert approved.version == 8
+    assert stub.requests["ApproveDraftChunk"].workspace == "default"
+
+    client.reject_draft_chunk("job-1", "chunk-1", workspace="default", reason="nope")
+    assert stub.requests["RejectDraftChunk"].reason == "nope"
+
+    all_result = client.approve_all_draft_chunks(
+        "job-1", workspace="default", include_security_flagged=True
+    )
+    assert all_result.chunks_approved == 2
+    assert all_result.chunks_skipped == 1
+    assert stub.requests["ApproveAllDraftChunks"].include_security_flagged is True
+
+
+def test_update_config_requires_sandbox_policy_type() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    with pytest.raises(TypeError, match="SandboxPolicy"):
+        client.update_config("job-1", {"not": "a proto"}, workspace="default")
+
+
+def test_update_config_forwards_workspace_and_maps_result() -> None:
+    stub = _FakeProviderPolicyStub()
+    client = _client_with_fake_stub(stub)
+
+    result = client.update_config(
+        "job-1",
+        sandbox_pb2.SandboxPolicy(),
+        workspace="default",
+        expected_resource_version=2,
+    )
+
+    req = stub.requests["UpdateConfig"]
+    assert req.workspace == "default"
+    assert req.expected_resource_version == 2
+    assert result.version == 11
+    assert result.policy_hash == "xyz"
+    assert result.settings_revision == 3

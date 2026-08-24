@@ -6,8 +6,10 @@ pub mod driver;
 pub mod grpc;
 
 pub use config::{
-    DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig,
-    SupervisorSideloadMethod,
+    AppArmorProfile, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
+    DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, KubernetesSidecarConfig,
+    ManagedSshIngressConfig, OperatorNamespaceAllowlist, SupervisorSideloadMethod,
+    SupervisorTopology, WorkspaceMode, managed_namespace_prefix,
 };
 pub use driver::{KubernetesComputeDriver, KubernetesDriverError};
 pub use grpc::ComputeDriverService;
